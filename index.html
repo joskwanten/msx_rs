@@ -26,8 +26,13 @@
             outline: none;
         }
     </style>
-    <!-- Trunk replaces this with the compiled WASM + loader. -->
-    <link data-trunk rel="rust" data-bin="msx_rs" data-wasm-opt="z" />
+    <!-- Trunk replaces this with the compiled WASM + loader.
+         data-wasm-opt="0" disables wasm-opt entirely; the size win it gives
+         (~3× smaller bundle) clashes with wasm-bindgen's reference-types
+         feature, which wasm-opt strips at -Oz without --enable-reference-types,
+         breaking `__wbindgen_init_externref_table` at startup. Cleanest fix
+         until trunk lets us pass that flag inline. -->
+    <link data-trunk rel="rust" data-bin="msx_rs" data-wasm-opt="0" />
 </head>
 <body>
 </body>
