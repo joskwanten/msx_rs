@@ -27,12 +27,15 @@
         }
     </style>
     <!-- Trunk replaces this with the compiled WASM + loader.
-         data-wasm-opt="0" disables wasm-opt entirely; the size win it gives
-         (~3× smaller bundle) clashes with wasm-bindgen's reference-types
-         feature, which wasm-opt strips at -Oz without --enable-reference-types,
-         breaking `__wbindgen_init_externref_table` at startup. Cleanest fix
-         until trunk lets us pass that flag inline. -->
-    <link data-trunk rel="rust" data-bin="msx_rs" data-wasm-opt="0" />
+         wasm-bindgen 0.2.90+ emits externref tables (reference-types Wasm
+         feature). At -Oz, wasm-opt strips those tables unless explicitly
+         told to keep them — without --enable-reference-types you get
+         `RangeError: failed to grow table by 4` at startup inside
+         __wbindgen_init_externref_table. The --enable-bulk-memory flag
+         covers the same class of issue for bulk memory ops, which newer
+         wasm-bindgen also uses. -->
+    <link data-trunk rel="rust" data-bin="msx_rs" data-wasm-opt="z"
+          data-wasm-opt-params="--enable-reference-types --enable-bulk-memory" />
 </head>
 <body>
 </body>

@@ -130,6 +130,17 @@ handler then runs near the top of the T-state budget.
 | ❌ | Save states |
 | ❌ | Sub-instruction timing accuracy |
 
+## Known issues
+
+- **WASM bundle is larger than necessary (~2.5 MB instead of ~700 KB).**
+  `index.html` currently uses `data-wasm-opt="0"` to disable `wasm-opt`. At
+  `-Oz` it strips wasm-bindgen's reference-types externref table, which
+  then breaks `__wbindgen_init_externref_table` at startup with
+  `RangeError: failed to grow table by 4`. Re-enable once Trunk exposes a
+  way to pass `--enable-reference-types --enable-bulk-memory` to `wasm-opt`
+  inline, or move the build to a custom `Trunk.toml` that invokes `wasm-opt`
+  with those flags explicitly.
+
 ## Credits
 
 - **C-BIOS** — used as the MSX1 BIOS and BASIC implementation. Open source,
