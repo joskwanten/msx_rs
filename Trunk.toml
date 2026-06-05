@@ -1,0 +1,14 @@
+# Build configuration that Trunk picks up automatically. Beats inline
+# `data-*` attributes when we need cross-cutting tool settings.
+
+[build]
+release = true
+
+[tools]
+# Pin Binaryen / wasm-opt to a recent version. The default that ships with
+# Trunk 0.21 is old enough to strip wasm-bindgen's reference-types externref
+# tables at -Oz, which then breaks `__wbindgen_init_externref_table` at
+# startup with a `RangeError: failed to grow table by 4`. Newer Binaryen
+# (118+) auto-detects the Wasm features used in the input and preserves them,
+# so the optimised output keeps the externref table intact.
+wasm_opt = "version_123"
