@@ -1,0 +1,24 @@
+# Rust / Cargo build artifacts
+/target/
+
+# Trunk WASM build output
+/dist/
+
+# Local Claude session state
+.claude/
+
+# macOS Finder metadata
+.DS_Store
+
+# Stray temp files (sed -i.tmp, editor backups, etc.)
+*.tmp
+*.swp
+*.swo
+*~
+
+# Editor / IDE
+/.idea/
+/.vscode/
+
+# Local roms for testing, not part of the project
+/games

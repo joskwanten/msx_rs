@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>MSX.rs</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            background: #000;
+            overflow: hidden;
+        }
+        canvas {
+            /* `position: fixed` + 100%/100% beats any default styling winit
+               (or the browser) might attach to the auto-created canvas. */
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            /* `image-rendering: pixelated` keeps the chunky retro look when
+               the shader's integer scale + the browser scale combine. */
+            image-rendering: pixelated;
+            outline: none;
+        }
+    </style>
+    <!-- Trunk replaces this with the compiled WASM + loader. -->
+    <link data-trunk rel="rust" data-bin="msx_rs" data-wasm-opt="z" />
+</head>
+<body>
+</body>
+</html>

@@ -1,0 +1,33 @@
+[package]
+name = "msx_rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = { version = "1.25.0", features = ["derive"] }
+psg = "1.0"
+wgpu = "29.0.3"
+winit = "0.30"
+z80emu = "0.11"
+
+# Native-only: real audio output + a blocking executor for async setup.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cpal = "0.17"
+pollster = "0.4"
+
+# Web-only: bindings to JS, a `spawn_local`-style async runtime, a
+# panic hook that surfaces Rust panics to the browser console, and a
+# wasm-safe `Instant`/`Duration` (std's panics on `wasm32-unknown-unknown`).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Document", "Window", "Element", "HtmlElement", "HtmlCanvasElement", "CssStyleDeclaration",
+    "AudioContext", "AudioContextState", "AudioNode", "AudioDestinationNode", "AudioBuffer",
+    "AudioProcessingEvent", "ScriptProcessorNode",
+    "Location", "Url", "UrlSearchParams", "Response", "Request", "RequestInit",
+    "DragEvent", "DataTransfer", "Blob", "File", "FileList", "Event", "EventTarget",
+] }
+web-time = "1.1"

@@ -1,0 +1,396 @@
+//! MSX primary slot selection.
+//!
+//! The Z80's 64 KiB address space is split into four 16 KiB pages, and each
+//! page can be served by one of four primary slots. The *slot register*
+//! (exposed on I/O port 0xA8) encodes the choice: two bits per page,
+//! low two bits = page 0.
+//!
+//! ```text
+//!   slot_register: SSPP_NNMM
+//!                  ││ ││ │└─ page 0 slot
+//!                  ││ │└─── page 1 slot
+//!                  │└─────── page 2 slot
+//!                  └──────── page 3 slot
+//! ```
+//!
+//! For now this models primary slots only. Subslot expansion (the `FFFFh`
+//! write/read protocol on expanded slots) lands as a future [`Slot`] variant.
+
+#![allow(dead_code)] // WIP module — some variants (Rom) wait for BIOS data.
+
+use crate::bus::Memory;
+use crate::scc::Scc;
+use std::sync::{Arc, Mutex};
+
+/// One slot's contents. New slot types extend this enum — that's the price
+/// (and benefit) of static dispatch: the compiler reminds you everywhere a
+/// new variant needs handling.
+pub enum Slot {
+    /// Nothing plugged in. Reads return 0xFF (open bus), writes ignored.
+    Empty,
+    /// Read-only memory: BIOS, BASIC, cartridge ROM.
+    Rom(RomSlot),
+    /// 64 KiB of RAM, addressable across all pages.
+    Ram(RamSlot),
+    /// An expanded slot: 4 subslots selected via the FFFFh protocol.
+    /// Boxed because the variant transitively contains `[Slot; 4]` — otherwise
+    /// the enum would have infinite size.
+    Subslotted(Box<SubslottedSlot>),
+    /// Konami SCC mega-ROM (Salamander, Nemesis 2/3, F1-Spirit, Snake's Revenge).
+    KonamiMegaRomSccCartridge(KonamiMegaRomSccCartridge),
+    /// Konami "basic" mega-ROM, no SCC (Penguin Adventure, Knightmare, Goonies).
+    KonamiMegaRomCartridge(KonamiMegaRomCartridge),
+}
+
+impl Memory for Slot {
+    fn read8(&self, addr: u16) -> u8 {
+        match self {
+            Slot::Empty => 0xFF,
+            Slot::Rom(r) => r.read8(addr),
+            Slot::Ram(r) => r.read8(addr),
+            Slot::Subslotted(s) => s.read8(addr),
+            Slot::KonamiMegaRomSccCartridge(c) => c.read8(addr),
+            Slot::KonamiMegaRomCartridge(c) => c.read8(addr),
+        }
+    }
+
+    fn write8(&mut self, addr: u16, value: u8) {
+        match self {
+            Slot::Empty => {}
+            Slot::Rom(_) => {} // ROM: writes ignored
+            Slot::Ram(r) => r.write8(addr, value),
+            Slot::Subslotted(s) => s.write8(addr, value),
+            Slot::KonamiMegaRomSccCartridge(c) => c.write8(addr, value),
+            Slot::KonamiMegaRomCartridge(c) => c.write8(addr, value),
+        }
+    }
+}
+
+/// A ROM-backed slot. Holds a blob mapped at `base`; reads outside its
+/// range return 0xFF (open bus).
+///
+/// For VG-8020 BIOS+BASIC: `RomSlot::new(rom_bytes, 0x0000)`, where
+/// `rom_bytes` is 32 KiB covering pages 0 and 1.
+pub struct RomSlot {
+    rom: Box<[u8]>,
+    base: u16,
+}
+
+impl RomSlot {
+    pub fn new(rom: Box<[u8]>, base: u16) -> Self {
+        Self { rom, base }
+    }
+}
+
+impl Memory for RomSlot {
+    fn read8(&self, addr: u16) -> u8 {
+        let offset = addr.wrapping_sub(self.base) as usize;
+        self.rom.get(offset).copied().unwrap_or(0xFF)
+    }
+
+    fn write8(&mut self, _addr: u16, _value: u8) {
+        // ROM — writes silently ignored.
+    }
+}
+
+/// 64 KiB of RAM. On the VG-8020 this lives in slot 3 (later: subslot 3-3).
+pub struct RamSlot {
+    ram: Box<[u8; 0x10000]>,
+}
+
+impl RamSlot {
+    pub fn new() -> Self {
+        Self {
+            ram: Box::new([0u8; 0x10000]),
+        }
+    }
+}
+
+impl Default for RamSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Memory for RamSlot {
+    fn read8(&self, addr: u16) -> u8 {
+        self.ram[addr as usize]
+    }
+
+    fn write8(&mut self, addr: u16, value: u8) {
+        self.ram[addr as usize] = value;
+    }
+}
+
+/// Primary slot map. Owns the slot register and the four slot contents.
+pub struct Slots {
+    pub slot_register: u8,
+    slots: [Slot; 4],
+}
+
+impl Slots {
+    pub fn new(slots: [Slot; 4]) -> Self {
+        Self {
+            slot_register: 0,
+            slots,
+        }
+    }
+
+    /// Replace the contents of one primary slot. Used at runtime when the
+    /// user drops a new cartridge into a running emulator — bus-level state
+    /// (slot register etc.) is left alone; the CPU reset that follows the
+    /// swap will redo slot selection through the BIOS init.
+    pub fn set_slot(&mut self, idx: usize, slot: Slot) {
+        self.slots[idx] = slot;
+    }
+
+    /// Decode which slot is currently mapped to the page containing `addr`.
+    ///
+    /// Returning a `usize` (rather than `&Slot`) lets the caller borrow
+    /// `&mut self.slots[idx]` afterwards without a lifetime conflict — small
+    /// but recurring borrow-checker dance in Rust emulator code.
+    fn selected_index(&self, addr: u16) -> usize {
+        let page = (addr >> 14) as usize; // 0..3
+        ((self.slot_register >> (page * 2)) & 0b11) as usize
+    }
+}
+
+impl Memory for Slots {
+    fn read8(&self, addr: u16) -> u8 {
+        self.slots[self.selected_index(addr)].read8(addr)
+    }
+
+    fn write8(&mut self, addr: u16, value: u8) {
+        let idx = self.selected_index(addr);
+        self.slots[idx].write8(addr, value);
+    }
+}
+
+/// An expanded slot's four subslots, addressed via the FFFFh protocol:
+///
+/// - **Write to 0xFFFF** sets the subslot register. The byte is *not* also
+///   written to the underlying memory at 0xFFFF — that's a real-hardware
+///   detail, the expander circuit intercepts.
+/// - **Read from 0xFFFF** returns the *complement* of the subslot register.
+///   Software uses this to detect whether a slot is expanded: write a known
+///   value, read it back, check if it came back inverted.
+///
+/// Every other address routes through the subslot bits the same way the
+/// primary slot register does (two bits per 16 KiB page).
+pub struct SubslottedSlot {
+    pub subslot_register: u8,
+    subslots: [Slot; 4],
+}
+
+impl SubslottedSlot {
+    pub fn new(subslots: [Slot; 4]) -> Self {
+        Self {
+            subslot_register: 0,
+            subslots,
+        }
+    }
+
+    fn selected_index(&self, addr: u16) -> usize {
+        let page = (addr >> 14) as usize;
+        ((self.subslot_register >> (page * 2)) & 0b11) as usize
+    }
+}
+
+impl Memory for SubslottedSlot {
+    fn read8(&self, addr: u16) -> u8 {
+        if addr == 0xFFFF {
+            !self.subslot_register
+        } else {
+            self.subslots[self.selected_index(addr)].read8(addr)
+        }
+    }
+
+    fn write8(&mut self, addr: u16, value: u8) {
+        if addr == 0xFFFF {
+            self.subslot_register = value;
+        } else {
+            let idx = self.selected_index(addr);
+            self.subslots[idx].write8(addr, value);
+        }
+    }
+}
+
+/// Konami-SCC mega-ROM cartridge mapper.
+///
+/// The cartridge occupies pages 1 and 2 of the Z80 address space
+/// (0x4000-0xBFFF), divided into four 8 KiB *regions*. Each region has its
+/// own bank register pointing into the ROM. Bank switching is triggered by
+/// writes to one specific 2 KiB window per region:
+///
+/// | Region        | Address range   | Bank-switch window |
+/// |---------------|-----------------|--------------------|
+/// | 0x4000-0x5FFF | bank 1          | 0x5000-0x57FF      |
+/// | 0x6000-0x7FFF | bank 2          | 0x7000-0x77FF      |
+/// | 0x8000-0x9FFF | bank 3          | 0x9000-0x97FF      |
+/// | 0xA000-0xBFFF | bank 4          | 0xB000-0xB7FF      |
+///
+/// Writes anywhere else in the cartridge area are silently ignored — that's
+/// crucial: if we banked on every write (the naive approach), random
+/// stores from the game's runtime would corrupt the bank registers and
+/// the game would crash mid-init.
+///
+/// Special case: when the bank for region 0x8000-0x9FFF is set to `0x3F`,
+/// the address window 0x9800-0x9FFF turns into SCC sound-chip registers.
+/// Writes there do *not* change the bank — they would drive the audio chip.
+/// (We acknowledge them but drop the data; sound emulation is future work.)
+///
+/// Bank values are masked to 6 bits — Konami-SCC hardware addresses up to
+/// 64 banks (512 KiB).
+pub struct KonamiMegaRomSccCartridge {
+    rom: Box<[u8]>,
+    /// One bank register per 8 KiB address-space region. Initial state
+    /// presents banks 0..3 across the four cartridge regions, exposing the
+    /// first 32 KiB of ROM linearly at 0x4000-0xBFFF — that's where the
+    /// MSX "AB" cartridge header lives at 0x4000.
+    selected_pages: [u8; 8],
+    /// SCC sound chip. Shared with the audio thread; writes to the SCC
+    /// register window forward into it. `None` means no audio output
+    /// configured (e.g. during tests).
+    scc: Option<Arc<Mutex<Scc>>>,
+}
+
+const KONAMI_PAGE_SIZE: usize = 0x2000;
+const KONAMI_SCC_BANK: u8 = 0x3F;
+
+impl KonamiMegaRomSccCartridge {
+    pub fn new(rom: Box<[u8]>, scc: Option<Arc<Mutex<Scc>>>) -> Self {
+        Self {
+            rom,
+            selected_pages: [0, 0, 0, 1, 2, 3, 0, 0],
+            scc,
+        }
+    }
+
+    fn region(addr: u16) -> usize {
+        (addr >> 13) as usize // 0..7
+    }
+}
+
+impl Memory for KonamiMegaRomSccCartridge {
+    fn read8(&self, addr: u16) -> u8 {
+        let region = Self::region(addr);
+        let bank = self.selected_pages[region] as usize;
+        let offset = bank * KONAMI_PAGE_SIZE + (addr as usize & 0x1FFF);
+        self.rom.get(offset).copied().unwrap_or(0xFF)
+    }
+
+    fn write8(&mut self, addr: u16, value: u8) {
+        // SCC audio register window — bank 3 (region 4) at 0x9800-0x9FFF when
+        // that region's bank is the magic 0x3F. Forward to the audio chip
+        // (only the low 256 of the 2 KiB window contain real registers; the
+        // rest mirrors) and leave the bank register alone.
+        if (0x9800..=0x9FFF).contains(&addr) && self.selected_pages[4] == KONAMI_SCC_BANK {
+            if let Some(scc) = &self.scc {
+                let reg = (addr & 0xFF) as u8;
+                scc.lock().unwrap().write_reg(reg, value);
+            }
+            return;
+        }
+
+        // Bank switching only on writes to the 2 KiB select window of each
+        // cartridge region. Anything else is ignored — that's what makes the
+        // mapper "precise" instead of "rough".
+        match addr {
+            0x5000..=0x57FF => self.selected_pages[2] = value & 0x3F,
+            0x7000..=0x77FF => self.selected_pages[3] = value & 0x3F,
+            0x9000..=0x97FF => self.selected_pages[4] = value & 0x3F,
+            0xB000..=0xB7FF => self.selected_pages[5] = value & 0x3F,
+            _ => {}
+        }
+    }
+}
+
+/// Konami "standard" mega-ROM mapper — same 8 KiB region layout as the SCC
+/// variant but with different bank-select windows and no audio chip. Region
+/// 2 (0x4000-0x5FFF) is fixed to bank 0; the other three regions are switched
+/// by writing anywhere in their 8 KiB range:
+///
+/// | Region        | Switch window  |
+/// |---------------|----------------|
+/// | 0x4000-0x5FFF | (fixed bank 0) |
+/// | 0x6000-0x7FFF | 0x6000-0x7FFF  |
+/// | 0x8000-0x9FFF | 0x8000-0x9FFF  |
+/// | 0xA000-0xBFFF | 0xA000-0xBFFF  |
+///
+/// Games: Goonies, Penguin Adventure, Knightmare, Yie Ar Kung-Fu, and most
+/// pre-1987 Konami 128 KiB cartridges.
+pub struct KonamiMegaRomCartridge {
+    rom: Box<[u8]>,
+    selected_pages: [u8; 8],
+}
+
+impl KonamiMegaRomCartridge {
+    pub fn new(rom: Box<[u8]>) -> Self {
+        Self {
+            rom,
+            selected_pages: [0, 0, 0, 1, 2, 3, 0, 0],
+        }
+    }
+}
+
+impl Memory for KonamiMegaRomCartridge {
+    fn read8(&self, addr: u16) -> u8 {
+        let region = (addr >> 13) as usize;
+        let bank = self.selected_pages[region] as usize;
+        let offset = bank * KONAMI_PAGE_SIZE + (addr as usize & 0x1FFF);
+        self.rom.get(offset).copied().unwrap_or(0xFF)
+    }
+
+    fn write8(&mut self, addr: u16, value: u8) {
+        match addr {
+            0x6000..=0x7FFF => self.selected_pages[3] = value & 0x3F,
+            0x8000..=0x9FFF => self.selected_pages[4] = value & 0x3F,
+            0xA000..=0xBFFF => self.selected_pages[5] = value & 0x3F,
+            _ => {}
+        }
+    }
+}
+
+/// Cartridge mapper type, returned by [`detect_mapper`].
+pub enum CartridgeMapper {
+    /// Plain ROM (≤ 32 KiB), mapped linearly at 0x4000.
+    Plain,
+    /// Konami basic mega-ROM — bank-switch on writes to 0x6000/0x8000/0xA000.
+    KonamiBasic,
+    /// Konami SCC mega-ROM — bank-switch on writes to 0x5000/0x7000/0x9000/0xB000.
+    KonamiSCC,
+}
+
+/// Pick a mapper for the given ROM. Plain ROMs are detected by size; for
+/// larger ROMs we scan the code for `LD (nn), A` instructions targeting
+/// the bank-select address of either layout and pick the dominant one.
+///
+/// This is the same heuristic openMSX uses, in spirit — accurate enough for
+/// the vast majority of Konami cartridges. ROMs that need a different mapper
+/// entirely (ASCII8, ASCII16, R-Type, etc.) won't be detected; we'd need to
+/// add explicit detection or a manual override for those.
+pub fn detect_mapper(rom: &[u8]) -> CartridgeMapper {
+    if rom.len() <= 32 * 1024 {
+        return CartridgeMapper::Plain;
+    }
+
+    let mut scc_hits = 0u32;
+    let mut basic_hits = 0u32;
+    for window in rom.windows(3) {
+        // 0x32 = LD (nn), A — the most common bank-switch instruction.
+        if window[0] == 0x32 {
+            let addr = u16::from_le_bytes([window[1], window[2]]);
+            match addr {
+                0x5000 | 0x7000 | 0x9000 | 0xB000 => scc_hits += 1,
+                0x6000 | 0x8000 | 0xA000 => basic_hits += 1,
+                _ => {}
+            }
+        }
+    }
+
+    if scc_hits > basic_hits {
+        CartridgeMapper::KonamiSCC
+    } else {
+        CartridgeMapper::KonamiBasic
+    }
+}
