@@ -1,5 +1,6 @@
 mod audio;
 mod bus;
+mod log;
 mod post;
 mod ppi;
 mod scc;
@@ -33,6 +34,18 @@ use z80emu::{host::TsCounter, Cpu, Z80NMOS};
 /// `execute_with_limit` consumes this many cycles before we raise the next
 /// VBLANK and let the game's interrupt handler run.
 const FRAME_TSTATES: i32 = 59_659;
+
+/// Visible scan-lines per frame — the area the VDP actually renders. We
+/// step the CPU once per visible line so V9938 line interrupts and
+/// per-line register tricks (split-screen scroll, per-band SAT) can
+/// land in the right scanline. Bottom-border + VBlank lines are batched
+/// after the visible loop.
+const VISIBLE_LINES: u32 = 192;
+
+/// T-states budget per scanline. Frame budget divided by total NTSC line
+/// count (262) — close enough to real hardware (~228 T-states / line) that
+/// IRQ-driven games behave correctly.
+const SCANLINE_TSTATES: i32 = FRAME_TSTATES / 262;
 
 /// MSX target frame rate. We pace CPU emulation against wall-clock time so
 /// the emulator runs at the right speed regardless of host display refresh
@@ -392,17 +405,44 @@ impl State {
         self.msx_frame_accumulator = 0.0;
     }
 
-    /// Run the CPU for one MSX frame's worth of T-states. VBLANK is raised
-    /// at the start so the game's interrupt handler runs near the top of the
-    /// budget — in real hardware VBLANK asserts at the end of visible scan
-    /// and the CPU then has a frame to handle it; our coarse "one frame per
-    /// call" model is close enough until mid-frame timing matters.
+    /// Run the CPU for one MSX frame, stepping per scanline so V9938
+    /// line-interrupts can fire mid-frame and software-driven per-line
+    /// register changes (split-screen scroll, multiple SATs) actually
+    /// land where they're meant to.
+    ///
+    /// Layout (NTSC-ish, ~71 K T-states per frame at 3.58 MHz):
+    ///   * 192 visible scanlines, each ~228 T-states. Snapshot the
+    ///     per-scanline-mutable registers at the start of each, then
+    ///     run the CPU; if R0[4] (IE2) is set and the active line
+    ///     matches R19, fire a line interrupt so the game's handler
+    ///     gets a chance to update R5/R6/R11/R23 before the *next*
+    ///     line is captured.
+    ///   * VBlank — raise the frame-IRQ flag and run the rest of the
+    ///     frame's CPU budget in one go (no line-interrupt logic
+    ///     required outside of the visible area).
     fn step_frame(&mut self) {
-        self.bus.vdp.start_vblank();
         self.clock.0 = Wrapping(0);
-        let _ = self
-            .cpu
-            .execute_with_limit(&mut self.bus, &mut self.clock, FRAME_TSTATES);
+
+        // Visible scan-out, per line. `execute_with_limit` takes an
+        // ABSOLUTE clock target, not a delta — so the cumulative limit
+        // for line N is `SCANLINE_TSTATES * (N + 1)`. Passing the bare
+        // SCANLINE_TSTATES on every iteration would let only the FIRST
+        // call do any work; every subsequent call would see clock already
+        // past the limit and return immediately, starving the CPU.
+        for line in 0..VISIBLE_LINES {
+            self.bus.vdp.snapshot_scanline(line as usize);
+            if self.bus.vdp.line_irq_target(line as u8) && self.bus.vdp.regs[0] & 0x10 != 0 {
+                self.bus.vdp.fire_line_irq();
+            }
+            let limit = SCANLINE_TSTATES * (line as i32 + 1);
+            let _ = self.cpu.execute_with_limit(&mut self.bus, &mut self.clock, limit);
+        }
+
+        // Bottom border + VBlank. Frame interrupt fires here on real
+        // hardware; we trigger and run the CPU through the rest of the
+        // frame budget without line stepping.
+        self.bus.vdp.start_vblank();
+        let _ = self.cpu.execute_with_limit(&mut self.bus, &mut self.clock, FRAME_TSTATES);
     }
 
     /// Pace MSX emulation against wall-clock time. Uses a fractional-frame
@@ -767,6 +807,7 @@ impl ApplicationHandler for App {
 fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     {
+        log::init_from_environment();
         let event_loop = EventLoop::new().unwrap();
         let mut app = App::default();
         event_loop.run_app(&mut app).unwrap();
@@ -780,6 +821,7 @@ fn main() {
 #[wasm_bindgen::prelude::wasm_bindgen(start)]
 pub fn web_main() {
     console_error_panic_hook::set_once();
+    log::init_from_environment();
     use winit::platform::web::EventLoopExtWebSys;
     let event_loop = EventLoop::new().unwrap();
     let app = App::default();

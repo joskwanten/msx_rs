@@ -44,14 +44,15 @@ referenced via `include_bytes!`. Download them from
 [cbios.sourceforge.net](https://cbios.sourceforge.net/) and place:
 
 ```
-assets/cbios_main_msx1.rom    (32 KiB — BIOS routines)
+assets/cbios_main_msx2.rom    (32 KiB — MSX2 main BIOS, V9938 init)
+assets/cbios_sub.rom          (16 KiB — sub-ROM, SCREEN 4-8 helpers)
 assets/cbios_basic.rom        (16 KiB — BASIC interpreter, cartridge form)
 ```
 
-The emulator maps the main BIOS into slot 0 and the BASIC cartridge into
-slot 2. Slot 1 is the user cartridge socket — a game ROM goes there at
-runtime via drag-and-drop. With slot 1 empty the BIOS scan reaches slot 2
-and boots BASIC.
+The emulator maps the main BIOS into slot 0, the sub-ROM into subslot 3-1,
+and the BASIC cartridge into slot 2. Slot 1 is the user cartridge socket
+— a game ROM goes there at runtime via drag-and-drop. With slot 1 empty
+the BIOS scan reaches slot 2 and boots BASIC.
 
 ### Native
 

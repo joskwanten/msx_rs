@@ -8,12 +8,16 @@ they ship under the C-BIOS authors' own terms (see below).
 
 | File | Size | Maps to | Purpose |
 |---|---|---|---|
-| `cbios_main_msx1.rom` | 32 KiB | Slot 0, `0x0000-0x7FFF` | C-BIOS Main — BIOS routines only. Upper 16 KiB is empty padding. |
+| `cbios_main_msx2.rom` | 32 KiB | Slot 0, `0x0000-0x7FFF` | C-BIOS MSX2 Main — BIOS routines, V9938 init, MSX2 BASIC bootstrap. Backward-compatible with MSX1 software (V9938 supports TMS9918 modes). |
+| `cbios_sub.rom`       | 16 KiB | Slot 3-1, `0x0000-0x3FFF` | C-BIOS Sub-ROM — SCREEN 4-8 helpers (line drawing, palette, paging, BLOAD/BSAVE for graphics) and other V9938-specific routines. The main BIOS pages it in via inter-slot calls when needed. |
 | `cbios_basic.rom`     | 16 KiB | Slot 2, `0x4000-0x7FFF` | C-BIOS BASIC interpreter, formatted as a cartridge ("AB" header at offset 0, entry point 0x4010). |
 
 The BIOS scans primary slots 1 → 2 → 3 for "AB" cartridge headers. With a
 game in slot 1 (drag-and-drop), the scan stops there and the game boots.
 Without a game, slot 2 wins and the BASIC prompt appears.
+
+The MSX1-only main BIOS (`cbios_main_msx1.rom`) is no longer used — MSX2
+main is a strict superset (V9938 supports all TMS9918 modes).
 
 ## Source
 

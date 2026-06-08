@@ -37,7 +37,15 @@
 struct Uniforms {
     framebuffer_size: vec2<f32>,
     _pad: vec2<u32>,
-    regs: array<vec4<u32>, 2>,      // 8 bytes of registers, one per lane
+    regs: array<vec4<u32>, 6>,      // R0-R23 (one byte per u32 lane)
+    // Per-visible-scanline snapshots of R5 / R6 / R11 / R23, packed:
+    //   bits 0..7  = R5
+    //   bits 8..15 = R6
+    //   bits 16..23 = R11
+    //   bits 24..31 = R23
+    // 256 entries × 4 bytes, organised as 64 vec4<u32> (4 scanlines per
+    // vec4, low-to-high lane order).
+    scanline_regs: array<vec4<u32>, 64>,
     palette: array<vec4<f32>, 16>,  // TMS9918 fixed palette (index 0 = transparent)
 }
 
@@ -63,6 +71,28 @@ fn reg(i: u32) -> u32 {
 fn backdrop() -> u32 {
     return reg(7u) & 0x0Fu;
 }
+
+// ─── Per-scanline registers ───────────────────────────────────────────────
+//
+// V9938 software commonly reprograms R5 / R6 / R11 / R23 from a line-
+// interrupt handler to do split-screen scroll or per-band SAT switching.
+// The CPU side snapshots these four registers at the start of each
+// visible scanline and packs them into `scanline_regs` (4 bytes per
+// scanline, 4 scanlines per vec4). Rendering code looks up the line it's
+// painting and uses THESE values instead of the frame-static `reg(...)`.
+fn scanline_packed(line: u32) -> u32 {
+    let v = u.scanline_regs[line >> 2u];
+    switch line & 3u {
+        case 0u:  { return v.x; }
+        case 1u:  { return v.y; }
+        case 2u:  { return v.z; }
+        default:  { return v.w; }
+    }
+}
+fn line_r5(line: u32)  -> u32 { return  scanline_packed(line)        & 0xFFu; }
+fn line_r6(line: u32)  -> u32 { return (scanline_packed(line) >>  8u) & 0xFFu; }
+fn line_r11(line: u32) -> u32 { return (scanline_packed(line) >> 16u) & 0xFFu; }
+fn line_r23(line: u32) -> u32 { return (scanline_packed(line) >> 24u) & 0xFFu; }
 
 // In Graphic 1/2, fg/bg = 0 means transparent — fall through to backdrop.
 fn apply_transparency(color: u32) -> u32 {
@@ -316,12 +346,29 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     // Mode dispatch — see header comment for the M1/M2/M3 truth table.
     // M3 = R0 bit 1, M2 = R1 bit 3 (per TMS9918 datasheet).
+    // V9938 adds M4 = R0 bit 2 and M5 = R0 bit 3.
     let m1 = (reg(1u) >> 4u) & 1u;
     let m2 = (reg(1u) >> 3u) & 1u;
     let m3 = (reg(0u) >> 1u) & 1u;
+    let m4 = (reg(0u) >> 2u) & 1u;
+    let m5 = (reg(0u) >> 3u) & 1u;
 
     var color_idx: u32;
-    if (m3 == 1u) {
+    // V9938 modes (M4 or M5 set) are checked first. Only G4 (Screen 5,
+    // M5 M4 M3 = 0 1 1) is fully implemented; G3 (Screen 4) shares the
+    // same tile layout as G2 so it routes to shade_graphic2 — sprites
+    // are missing (V9938 sprite mode 2) but the bitmap is correct. Other
+    // V9938 modes fall through to a backdrop placeholder.
+    if (m5 == 0u && m4 == 1u && m3 == 1u && m2 == 0u && m1 == 0u) {
+        color_idx = shade_g4(px, py);
+    } else if (m5 == 0u && m4 == 1u && m3 == 0u && m2 == 0u && m1 == 0u) {
+        // G3 / Screen 4 — same tile-bank layout as G2 but with wider
+        // base-address masks for 128 KiB VRAM. Sprites use V9938 mode 2
+        // which is a separate code path (not yet wired up).
+        color_idx = shade_g3(px, py);
+    } else if (m4 == 1u || m5 == 1u) {
+        color_idx = backdrop();        // other V9938 modes not yet implemented
+    } else if (m3 == 1u) {
         color_idx = shade_graphic2(px, py);
     } else if (m1 == 1u) {
         color_idx = shade_graphic0(px, py);
@@ -332,4 +379,205 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     return u.palette[color_idx];
+}
+
+// ─── V9938 sprite mode 2 ───────────────────────────────────────────────────
+//
+// Used in G3 / G4 / G5 / G6 / G7 (Screens 4-8). Differences from TMS9918
+// sprite mode 1:
+//
+//   * 8 visible sprites per scan-line (was 4)
+//   * 32-sprite scan still terminates on a Y sentinel — but 0xD8 (216)
+//     instead of 0xD0
+//   * SAT is split in two:
+//
+//        attr_base = (R5[7:2] << 7) | (R11[1:0] << 15)   — 17-bit
+//        color_base = attr_base - 0x200
+//
+//     Attribute table: 32 × 4 bytes (Y / X / pattern / reserved)
+//     Color table:     32 × 16 bytes — one byte per scan-line of the
+//                      sprite (only first 8 used for 8×8 sprites)
+//
+//   * Color byte layout:
+//        bit 7 = IC (skip collision)
+//        bit 6 = CC (this line OR-mixes onto already-drawn sprites)
+//        bit 5 = 0
+//        bit 4 = EC (early clock — shift X by -32)
+//        bits 3-0 = colour (4-bit palette index, 0 = transparent)
+//
+//   * OR-mixing: when CC=1, the colour bits OR onto whatever colour was
+//     already produced for this fragment by a lower-numbered sprite.
+//     Used for multi-coloured sprites (stack several with different
+//     colour bits and CC set on the upper ones).
+//
+// We don't enforce per-frame sprite-count limits (no IRQ-on-overflow),
+// but we do cap at 8 visible sprites per line per the spec — going past
+// 8 silently drops further sprites.
+fn sample_sprite_mode2(px: u32, py: u32) -> u32 {
+    // Per-scanline R5 / R6 / R11: V9938 software often points to a
+    // different SAT for different bands of the screen via line interrupts.
+    // The CPU side captures these at the start of each visible scanline;
+    // we look up the one matching the current `py` here.
+    let r5 = line_r5(py);
+    let r11 = line_r11(py);
+    let attr_base = ((r5 & 0xFCu) << 7u) | ((r11 & 0x03u) << 15u);
+    let color_base = attr_base - 0x200u;
+    let sg_base = (line_r6(py) & 0x3Fu) << 11u;
+
+    let r1 = reg(1u);
+    let size16 = (r1 & 0x02u) != 0u;
+    let mag    = (r1 & 0x01u) != 0u;
+
+    var box_size: u32 = 8u;
+    if (size16) { box_size = 16u; }
+    if (mag)    { box_size = box_size * 2u; }
+
+    var hit_color: u32 = 0xFFu;
+    var sprites_drawn: u32 = 0u;
+
+    for (var s: u32 = 0u; s < 32u; s = s + 1u) {
+        let attr_addr = attr_base + s * 4u;
+        let y_raw = vram_byte(attr_addr);
+        // Mode-2 end-of-list sentinel.
+        if (y_raw == 0xD8u) { break; }
+
+        var sy: i32;
+        if (y_raw > 238u) {
+            sy = i32(y_raw) - 255;
+        } else {
+            sy = i32(y_raw) + 1;
+        }
+
+        let dy_screen = i32(py) - sy;
+        if (dy_screen < 0 || dy_screen >= i32(box_size)) { continue; }
+
+        // Demagnified line within the sprite.
+        var ly: u32 = u32(dy_screen);
+        if (mag) { ly = ly >> 1u; }
+
+        // Color byte for THIS line — mode 2's per-line feature.
+        let color_byte = vram_byte(color_base + s * 16u + ly);
+        let color = color_byte & 0x0Fu;
+        // Skip transparent colour first — saves an X/pattern lookup.
+        if (color == 0u) { continue; }
+
+        let ec = (color_byte & 0x20u) != 0u;
+        let cc = (color_byte & 0x40u) != 0u;
+
+        let x_raw = vram_byte(attr_addr + 1u);
+        var sx: i32 = i32(x_raw);
+        if (ec) { sx = sx - 32; }
+
+        let dx_screen = i32(px) - sx;
+        if (dx_screen < 0 || dx_screen >= i32(box_size)) { continue; }
+
+        var lx: u32 = u32(dx_screen);
+        if (mag) { lx = lx >> 1u; }
+
+        let pat = vram_byte(attr_addr + 2u);
+        var byte_offset: u32;
+        if (size16) {
+            // 16×16 = 4 patterns laid out TL/BL/TR/BR.
+            let quad_x = lx >> 3u;
+            let quad_y = ly >> 3u;
+            let pattern_idx = (pat & 0xFCu) + quad_x * 2u + quad_y;
+            byte_offset = pattern_idx * 8u + (ly & 7u);
+        } else {
+            byte_offset = pat * 8u + ly;
+        }
+
+        let pat_byte = vram_byte(sg_base + byte_offset);
+        let bit = 7u - (lx & 7u);
+        if (((pat_byte >> bit) & 1u) == 0u) { continue; }
+
+        // We've got a pixel hit. Track 8-per-line limit before mixing.
+        sprites_drawn = sprites_drawn + 1u;
+        if (sprites_drawn > 8u) { break; }
+
+        if (hit_color == 0xFFu) {
+            hit_color = color;
+        } else if (cc) {
+            // Later sprite ORs onto whatever's there — gives multi-colour
+            // sprites by stacking several with different bits set.
+            hit_color = hit_color | color;
+        }
+        // Otherwise keep the higher-priority (lower sprite index) colour.
+    }
+
+    return hit_color;
+}
+
+// ─── Screen 4 (G3) ──────────────────────────────────────────────────────────
+//
+// Same 32×24 tile grid as G2 with the same three-bank pattern/colour split,
+// but V9938 widens the base-address registers so tables can live anywhere in
+// the 128 KiB VRAM:
+//
+//   Name table       = R2[6:0] << 10                — was R2[3:0] in G2
+//   Colour table     = (R3[7:0] << 6) | (R10[2:0] << 14)
+//   Pattern table    = R4[5:2] << 11                — was R4[2] in G2
+//
+// MSX2 software writes these wider bits to push tables out of the first 16 KiB
+// (where MSX1 software lived) into higher banks. Our R14-aware VRAM
+// `read_data`/`write_data` already routes CPU writes to those banks; this
+// shader path completes the loop by reading them back from the right place.
+//
+// Sprites in G3 use V9938 mode 2 (8 per line, per-line colour, OR-mix). Not
+// implemented yet — this function just returns the bitmap.
+fn shade_g3(px: u32, py: u32) -> u32 {
+    let nt_base = (reg(2u) & 0x7Fu) << 10u;
+    let pt_base = (reg(4u) & 0x3Cu) << 11u;
+    let ct_base = ((reg(3u) & 0xFFu) << 6u) | ((reg(10u) & 0x07u) << 14u);
+
+    let tile_x = px >> 3u;
+    let tile_y = py >> 3u;
+    let sub_x  = px & 7u;
+    let sub_y  = py & 7u;
+    let third  = tile_y >> 3u;        // 0=top, 1=mid, 2=bottom
+
+    let tile_num = vram_byte(nt_base + tile_y * 32u + tile_x);
+    let bank_off = ((third << 8u) | tile_num) << 3u;
+
+    let pat = vram_byte(pt_base + bank_off + sub_y);
+    let col = vram_byte(ct_base + bank_off + sub_y);
+    let is_fg = ((pat >> (7u - sub_x)) & 1u) == 1u;
+    let bg = apply_transparency(select(col & 0x0Fu, (col >> 4u) & 0x0Fu, is_fg));
+
+    // G3 uses V9938 sprite mode 2.
+    let sprite = sample_sprite_mode2(px, py);
+    if (sprite < 16u) { return sprite; }
+    return bg;
+}
+
+// ─── Screen 5 (G4) ──────────────────────────────────────────────────────────
+//
+// 256×212 4 bpp bitmap. Two pixels per VRAM byte (high nibble = leftmost
+// pixel), 128 bytes per row → 27 136 bytes for one display page.
+//
+// R2[6:5] selects the display page (4 × 32 KiB):
+//   page 0 base = 0x00000
+//   page 1 base = 0x08000
+//   page 2 base = 0x10000
+//   page 3 base = 0x18000
+//
+// Pixel value is a 4-bit palette index → u.palette[idx].
+fn shade_g4(px: u32, py: u32) -> u32 {
+    let page_base = ((reg(2u) >> 5u) & 3u) << 15u;
+    // R23 is the vertical-scroll register and changes per-scanline on
+    // most MSX2 software (line-interrupt-driven split-screen scrolls).
+    // Use the snapshot for THIS scanline. Bitmap rows wrap mod 256
+    // because a G4 page is 256 rows (32 KiB / 128 bytes-per-row).
+    // Sprites are unaffected — they're positioned by their own Y in
+    // the SAT, independent of R23.
+    let bitmap_y = (py + line_r23(py)) & 0xFFu;
+    let byte_addr = page_base + bitmap_y * 128u + (px >> 1u);
+    let byte = vram_byte(byte_addr);
+    // High nibble (px even) is the leftmost pixel.
+    let shift = (1u - (px & 1u)) * 4u;
+    let bg = (byte >> shift) & 0x0Fu;
+
+    // G4 uses V9938 sprite mode 2.
+    let sprite = sample_sprite_mode2(px, py);
+    if (sprite < 16u) { return sprite; }
+    return bg;
 }

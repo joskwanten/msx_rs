@@ -46,10 +46,20 @@ fn build_cartridge_slot(rom: Option<Vec<u8>>, scc: Arc<Mutex<Scc>>) -> Slot {
     }
 }
 
-/// C-BIOS Main ROM — 32 KiB, embedded at compile time. BIOS routines only
-/// (init, IO, ISR, VDP setup, RAM check); the upper 16 KiB is empty padding.
-/// Open source, no Microsoft/ASCII code. See <https://cbios.sourceforge.net/>.
-const CBIOS_MAIN: &[u8] = include_bytes!("../assets/cbios_main_msx1.rom");
+/// C-BIOS MSX2 Main ROM — 32 KiB, embedded at compile time. BIOS routines
+/// including V9938 init, IO, ISR, and MSX2 BASIC bootstrap. Mounted at slot
+/// 0, mapped at 0x0000-0x7FFF. Backward-compatible with MSX1 software:
+/// TMS9918 modes remain available because the V9938 implements them as
+/// subset modes. Open source, no Microsoft/ASCII code.
+/// See <https://cbios.sourceforge.net/>.
+const CBIOS_MAIN: &[u8] = include_bytes!("../assets/cbios_main_msx2.rom");
+
+/// C-BIOS Sub-ROM — 16 KiB, embedded at compile time. Contains the MSX2
+/// SCREEN 4-8 helpers (line drawing, palette, SET PAGE, BLOAD/BSAVE for
+/// graphics, etc.) and a few extension routines the main BIOS calls into
+/// via inter-slot calls. Mounted in subslot 3-1, mapped at 0x0000 within
+/// that subslot — the main BIOS pages it in via standard slot switching.
+const CBIOS_SUB: &[u8] = include_bytes!("../assets/cbios_sub.rom");
 
 /// C-BIOS BASIC interpreter — 16 KiB cartridge ROM with the standard MSX
 /// "AB" cartridge header at offset 0 and entry point 0x4010. We slot it
@@ -97,22 +107,30 @@ impl Bus {
         scc: Arc<Mutex<Scc>>,
         cartridge_rom: Option<Vec<u8>>,
     ) -> Self {
-        // VG-8020-ish slot layout, adapted for the C-BIOS split between
-        // BIOS (slot 0) and BASIC (slot 2):
-        //   Slot 0: C-BIOS Main — BIOS routines, 32 KiB at 0x0000.
-        //   Slot 1: external cartridge socket — game ROM when provided,
-        //           empty otherwise. Drag-and-drop swaps this slot at runtime.
-        //   Slot 2: C-BIOS BASIC — 16 KiB cartridge-style ROM at 0x4000.
-        //           The BIOS scans slots in order; with slot 1 empty it falls
-        //           through to BASIC here. With a game in slot 1, that wins
-        //           the scan and BASIC stays dormant.
-        //   Slot 3: expanded — RAM lives in subslot 3-3, the rest empty.
+        // MSX2 slot layout (C-BIOS-style):
+        //   Slot 0:    C-BIOS MSX2 Main — 32 KiB BIOS at 0x0000.
+        //   Slot 1:    external cartridge socket — game ROM when provided,
+        //              empty otherwise. Drag-and-drop swaps this slot at runtime.
+        //   Slot 2:    C-BIOS BASIC — 16 KiB cartridge-style ROM at 0x4000.
+        //              Slot-scan order means a game in slot 1 wins; without
+        //              one, BASIC fires.
+        //   Slot 3:    expanded —
+        //              3-0: empty
+        //              3-1: C-BIOS Sub-ROM (display/SCREEN 4-8 helpers, 16 KiB
+        //                   at 0x0000). The main BIOS pages it in via inter-
+        //                   slot calls (CALSLT) when it needs the V9938-specific
+        //                   routines.
+        //              3-2: empty
+        //              3-3: 64 KiB RAM — the mapper for >64 KiB extended RAM
+        //                   lands in a follow-up sub-phase, MSX2 BIOS boots
+        //                   with this flat RAM regardless.
         let bios = RomSlot::new(Box::from(CBIOS_MAIN), 0x0000);
         let basic = RomSlot::new(Box::from(CBIOS_BASIC), 0x4000);
+        let sub_rom = RomSlot::new(Box::from(CBIOS_SUB), 0x0000);
 
         let slot3 = SubslottedSlot::new([
             Slot::Empty,                   // 3-0
-            Slot::Empty,                   // 3-1
+            Slot::Rom(sub_rom),            // 3-1 ← C-BIOS Sub-ROM
             Slot::Empty,                   // 3-2
             Slot::Ram(RamSlot::new()),     // 3-3 ← RAM
         ]);
@@ -183,6 +201,11 @@ impl Io for Bus {
     fn out8(&mut self, port: u8, value: u8) {
         match port {
             0x98 | 0x99 => self.vdp.out8(port, value),
+            // V9938 palette write (0x9A) and indirect register write (0x9B).
+            // MSX1 software never touches these; the VDP itself ignores
+            // them silently if registers aren't wired up yet, so it's safe
+            // to route them unconditionally regardless of machine type.
+            0x9A | 0x9B => self.vdp.out8(port, value),
             // PSG register select — store the index for the next 0xA1 write.
             // Only the low 4 bits select a real register (0..13); higher
             // values address ports A and B of the PSG (keyboard scan, etc.).
