@@ -8,6 +8,25 @@
 
 use crate::mlog;
 
+/// TEMP DIAGNOSTIC: per-opcode VDP command counter (index = R46>>4), plus a
+/// capture of the most recent LINE command's parameters. Dumped and reset by
+/// `dump_bands`. Remove together with the rest of the band-dump scaffolding.
+static CMD_COUNTS: [std::sync::atomic::AtomicU32; 16] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+/// Last LINE command: [dx, dy, nx, ny, maj_is_y, dix, diy] packed loosely.
+static LAST_LINE: [std::sync::atomic::AtomicI32; 7] =
+    [const { std::sync::atomic::AtomicI32::new(0) }; 7];
+/// TEMP DIAGNOSTIC: trace of HMMV fills and HMMM blits into page 1 (the HUD),
+/// drained by `dump_bands`. Capped so it stays bounded when dumping is off.
+static BLIT_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+fn blit_log(s: String) {
+    if let Ok(mut v) = BLIT_LOG.lock() {
+        if v.len() < 80 {
+            v.push(s);
+        }
+    }
+}
+
 // 128 KiB — V9938 maximum. The shader still only reads the first 16 KiB
 // for MSX1 modes, but the command engine targets the full address space
 // via R2 (display page) and R14 (extended VRAM address bit). Keeping the
@@ -394,6 +413,7 @@ impl Vdp {
     }
 
     pub fn upload(&self, queue: &wgpu::Queue, framebuffer_size: (u32, u32)) {
+        self.dump_bands(); // TEMP: opt-in via MSX_DUMP_BANDS=1
         queue.write_buffer(&self.vram_buf, 0, &self.vram[..]);
 
         // Pack R0-R23 into 6 vec4<u32> chunks. The shader needs R10/R11
@@ -456,7 +476,16 @@ impl Vdp {
     /// "final" by the time VBLANK fires. The CPU's VBLANK ISR then reads
     /// the full status byte in one go (which also clears it).
     pub fn start_vblank(&mut self) {
-        self.update_sprite_status();
+        // Dispatch sprite status update by the V9938 sprite mode the
+        // current display mode selects:
+        //   1 = TMS9918 (G1/G2/MC): 4 per line, 5S flag, simple collision
+        //   2 = V9938 (G3..G7): 8 per line, 9S flag, CC/IC-aware collision
+        //   0 = text modes / no sprites: skip status update entirely
+        match self.sprite_mode() {
+            1 => self.update_sprite_status(),
+            2 => self.update_sprite_status_mode2(),
+            _ => {}
+        }
         self.status[0] |= 0x80;
         // S2 bit 6 (VR) = "vertical retrace in progress". Beam-racing
         // V9938 code polls this to detect the start of VBlank rather
@@ -472,6 +501,30 @@ impl Vdp {
         self.status[2] &= !0x40;
     }
 
+    /// Get the current display-mode byte in the same encoding openMSX uses:
+    ///   bits 4..2 = M5..M3 (from R0 bits 3..1)
+    ///   bits 1..0 = M2..M1 (from R1 bits 4..3)
+    /// Maps directly to constants like 0x00=G1, 0x04=G2, 0x0C=G4, etc.
+    fn display_mode_byte(&self) -> u8 {
+        let m5_m3 = (self.regs[0] & 0x0E) << 1; // R0 bits 3..1 → bits 4..2
+        let m2_m1 = (self.regs[1] & 0x18) >> 3; // R1 bits 4..3 → bits 1..0
+        m5_m3 | m2_m1
+    }
+
+    /// Sprite hardware mode selected by the current display mode.
+    ///   0 = no sprites (text modes)
+    ///   1 = TMS9918 sprite mode 1 (G1, G2, MULTICOLOR) — 4 per line, single colour
+    ///   2 = V9938 sprite mode 2 (G3, G4, G5, G6, G7) — 8 per line, per-line colour
+    ///
+    /// Matches openMSX DisplayMode::getSpriteMode.
+    fn sprite_mode(&self) -> u8 {
+        match self.display_mode_byte() {
+            0x00 | 0x02 | 0x04 => 1,                      // G1, MC, G2
+            0x08 | 0x0C | 0x10 | 0x14 | 0x1C => 2,        // G3, G4, G5, G6, G7
+            _ => 0,                                       // T1, T2, bogus modes
+        }
+    }
+
     /// Compute the per-frame sprite-related status bits:
     ///   bit 6 (5S): set when ≥5 sprites occupy the same scanline. The first
     ///               such encounter (lowest Y, then lowest sprite index)
@@ -483,8 +536,11 @@ impl Vdp {
     /// doesn't know they're invisible until after pattern lookup) but they
     /// don't contribute pixels to collision detection.
     fn update_sprite_status(&mut self) {
-        let sat_base = ((self.regs[5] & 0x7F) as usize) << 7;
-        let sg_base = ((self.regs[6] & 0x07) as usize) << 11;
+        // Per fMSX MSX.c MSK[] table (SCR 1/2/3): R5 mask 0xFF, R6 mask 0x3F.
+        // For V9938 also include R11 (A15/A16) for SAT in upper VRAM banks.
+        let sat_base = ((self.regs[5] as usize) << 7)
+            | ((self.regs[11] as usize & 0x03) << 15);
+        let sg_base = (self.regs[6] as usize & 0x3F) << 11;
         let r1 = self.regs[1];
         let size16 = r1 & 0x02 != 0;
         let mag = r1 & 0x01 != 0;
@@ -587,6 +643,304 @@ impl Vdp {
         }
     }
 
+    /// V9938 sprite mode 2 per-frame status update — sets S0 bits 6 (9S
+    /// overflow), 5 (collision), 4-0 (sprite # on overflow, or highest
+    /// sprite # processed otherwise), and the S3-S6 collision coordinates.
+    ///
+    /// Algorithm derived from openMSX SpriteChecker::checkSprites2
+    /// (src/video/SpriteChecker.cc). Differences from openMSX:
+    /// - We compute once at vblank instead of incrementally per scanline.
+    /// - Flat VRAM array instead of VRAMWindow.
+    /// - No mid-frame mode/SAT changes — we use the registers at vblank time.
+    ///   (Per-scanline R5/R11 snapshots affect the shader render path; this
+    ///   CPU-side status check uses the end-of-frame register values, which
+    ///   matches openMSX's atomic-at-frame-end model close enough for the
+    ///   games that poll S0.)
+    ///
+    /// S0 bit-layout (per V9938 spec section 2.1):
+    /// ```text
+    ///   bit 7 = F   (vertical interrupt flag, set later in start_vblank)
+    ///   bit 6 = 9S  (9 or more sprites on a single scanline)
+    ///   bit 5 = C   (sprite collision detected)
+    ///   bits 4..0  = 9th sprite # (if 9S set), otherwise highest sprite # processed
+    /// ```
+    ///
+    /// The 9S detection only updates when the F and 9S bits are both clear
+    /// (per TMS9918 documentation, retained for V9938). This makes 9S sticky
+    /// — once raised, it stays until the CPU reads S0 and clears the flag.
+    fn update_sprite_status_mode2(&mut self) {
+        let attr_base = ((self.regs[5] as usize & 0xFC) << 7)
+            | ((self.regs[11] as usize & 0x03) << 15);
+        let color_base = attr_base.wrapping_sub(0x200);
+        let sg_base = ((self.regs[6] as usize) & 0x3F) << 11;
+
+        let r1 = self.regs[1];
+        let size16 = r1 & 0x02 != 0;
+        let mag = r1 & 0x01 != 0;
+        let size: i32 = if size16 { 16 } else { 8 };
+        let mag_size: i32 = if mag { size * 2 } else { size };
+        let pattern_index_mask: u8 = if size16 { 0xFC } else { 0xFF };
+
+        let display_delta = self.regs[23] as i32; // R23 vertical scroll
+        let visible_lines: i32 = if self.regs[9] & 0x80 != 0 { 212 } else { 192 };
+
+        // Per-line collected sprite info. Vec for clarity; capped at 9 entries
+        // (we stop adding after we've recorded the 9th-sprite event, but we
+        // still need to walk the sprite for collision detection up to slot 8).
+        #[derive(Copy, Clone)]
+        struct SpriteOnLine {
+            x: i32,
+            pattern: u32, // 32-bit bitmap, MSB-first
+            color_attrib: u8,
+        }
+        let empty = SpriteOnLine { x: 0, pattern: 0, color_attrib: 0 };
+        let mut sprites_per_line: Vec<[SpriteOnLine; 8]> =
+            vec![[empty; 8]; visible_lines as usize];
+        let mut sprite_count: Vec<u8> = vec![0u8; visible_lines as usize];
+
+        let mut ninth_sprite_num: i32 = -1;
+        let mut ninth_sprite_line: i32 = i32::MAX;
+        let mut sprite: usize = 0;
+
+        while sprite < 32 {
+            let attr_addr = attr_base + sprite * 4;
+            // Defensive: VRAM is 128 KiB so attr_base fits, but masking keeps
+            // us safe if R5/R11 produce an out-of-range value.
+            let y_raw = self.vram[attr_addr & (VRAM_SIZE - 1)] as i32;
+            if y_raw == 216 {
+                break;
+            }
+
+            for line in 0..visible_lines {
+                // Per V9938 / TMS9918 spec: Y stored = actual_top - 1, so
+                // a sprite with Y=0 has its top row at display line 1, not
+                // 0. fMSX (Common.h ColorSprites) encodes this as the
+                // strict inequality `Y > K`; we get the same effect by
+                // subtracting 1 from the row computation. Without this we
+                // count sprites on the line above where they actually appear.
+                let sprite_line = (line + display_delta - y_raw - 1) & 0xFF;
+                if sprite_line >= mag_size {
+                    continue;
+                }
+
+                let idx = sprite_count[line as usize] as usize;
+                if idx >= 8 {
+                    // Sprite slot 9+. Record the earliest line where this
+                    // occurs and the lowest sprite # producing it.
+                    if line < ninth_sprite_line {
+                        ninth_sprite_line = line;
+                        ninth_sprite_num = sprite as i32;
+                    }
+                    continue;
+                }
+
+                // De-magnify for VRAM lookup.
+                let line_in_sprite = if mag { (sprite_line >> 1) as u32 } else { sprite_line as u32 };
+
+                // Per-line color byte.
+                let color_addr =
+                    color_base.wrapping_add(sprite * 16 + line_in_sprite as usize)
+                        & (VRAM_SIZE - 1);
+                let color_byte = self.vram[color_addr];
+
+                let x_raw = self.vram[(attr_addr + 1) & (VRAM_SIZE - 1)] as i32;
+                let pat_byte = self.vram[(attr_addr + 2) & (VRAM_SIZE - 1)];
+
+                let mut x = x_raw;
+                if color_byte & 0x80 != 0 {
+                    x -= 32; // EC bit
+                }
+
+                let pattern = self.build_sprite_pattern_mode2(
+                    sg_base,
+                    pat_byte & pattern_index_mask,
+                    line_in_sprite,
+                    size16,
+                    mag,
+                );
+
+                sprites_per_line[line as usize][idx] = SpriteOnLine {
+                    x,
+                    pattern,
+                    color_attrib: color_byte,
+                };
+                sprite_count[line as usize] = (idx + 1) as u8;
+            }
+
+            sprite += 1;
+        }
+
+        let highest_processed = sprite.min(31) as u8;
+
+        // S0 bits 6 and 4-0. Bit 7 (F) is set later in start_vblank.
+        // Per setSpriteStatus semantic, only bits 6-0 update; F is preserved.
+        let old_status = self.status[0];
+        let mut new_lo = old_status & 0x7F; // working copy without F
+
+        if ninth_sprite_num >= 0 {
+            // 9S detection is only active when F and 9S are both clear
+            // (per TMS9918.pdf and confirmed for V9938 — Dragon Quest 2
+            // and similar games depend on this).
+            if old_status & 0xC0 == 0 {
+                new_lo = 0x40 | (new_lo & 0x20) | ((ninth_sprite_num as u8) & 0x1F);
+            }
+        }
+        if new_lo & 0x40 == 0 {
+            // No 9th sprite detected — bits 4..0 hold the highest sprite #
+            // we processed. Keep the existing collision bit (bit 5).
+            new_lo = (new_lo & 0x20) | (highest_processed & 0x1F);
+        }
+        self.status[0] = (old_status & 0x80) | (new_lo & 0x7F);
+
+        // Collision detection — skip if already raised (sticky until S0 read).
+        if self.status[0] & 0x20 != 0 {
+            return;
+        }
+
+        // V9938 colour-0 collision rule: when TP=0 (R8 bit 5 clear, the
+        // default), colour 0 is transparent and doesn't trigger collisions.
+        // When TP=1, colour 0 is opaque and contributes to collisions.
+        let tp = self.regs[8] & 0x20 != 0;
+        let can0_collide = tp;
+
+        for line in 0..visible_lines {
+            let count = sprite_count[line as usize] as usize;
+            if count < 2 {
+                continue;
+            }
+            let line_sprites = &sprites_per_line[line as usize];
+
+            let mut min_x_collision: i32 = i32::MAX;
+            let max_i = count.min(8);
+
+            for i in (1..max_i).rev() {
+                let s_i = &line_sprites[i];
+                let color_i = s_i.color_attrib & 0x0F;
+                if !can0_collide && color_i == 0 {
+                    continue;
+                }
+                // CC (0x40) or IC (0x20) set → this sprite can't collide.
+                if s_i.color_attrib & 0x60 != 0 {
+                    continue;
+                }
+
+                let x_i = s_i.x;
+                let pattern_i = s_i.pattern;
+
+                for j in (0..i).rev() {
+                    let s_j = &line_sprites[j];
+                    let color_j = s_j.color_attrib & 0x0F;
+                    if !can0_collide && color_j == 0 {
+                        continue;
+                    }
+                    if s_j.color_attrib & 0x60 != 0 {
+                        continue;
+                    }
+
+                    let x_j = s_j.x;
+                    let dist = x_j - x_i;
+                    if dist <= -mag_size || dist >= mag_size {
+                        continue;
+                    }
+
+                    // Shift sprite j's pattern to align with sprite i's
+                    // coordinate frame, then AND for overlap. checked_shl/shr
+                    // avoid UB at full-width shifts (Rust panics otherwise).
+                    let pattern_j = if dist < 0 {
+                        s_j.pattern.checked_shl((-dist) as u32).unwrap_or(0)
+                    } else {
+                        s_j.pattern.checked_shr(dist as u32).unwrap_or(0)
+                    };
+                    let mut col_pat = pattern_i & pattern_j;
+
+                    // Sprite extending past left edge (x_i < 0) — mask off
+                    // the off-screen pixels so they don't count as collisions.
+                    if x_i < 0 {
+                        let valid_bits = (32 + x_i) as u32;
+                        if valid_bits == 0 {
+                            col_pat = 0;
+                        } else if valid_bits < 32 {
+                            col_pat &= (1u32 << valid_bits) - 1;
+                        }
+                    }
+
+                    if col_pat != 0 {
+                        let x_collision = x_i + col_pat.leading_zeros() as i32;
+                        if x_collision >= 0 && x_collision < min_x_collision {
+                            min_x_collision = x_collision;
+                        }
+                    }
+                }
+            }
+
+            if min_x_collision < 256 {
+                self.status[0] |= 0x20;
+                // Coords stored with V9938-spec offsets. Upper bits of S#4
+                // and S#6 are hardwired to 1 per spec section 2.8.
+                let x_coord = min_x_collision + 12;
+                let y_coord = line + 8;
+                self.status[3] = (x_coord & 0xFF) as u8;
+                self.status[4] = (((x_coord >> 8) & 0x01) as u8) | 0xFE;
+                self.status[5] = (y_coord & 0xFF) as u8;
+                self.status[6] = (((y_coord >> 8) & 0x03) as u8) | 0xFC;
+                return;
+            }
+        }
+    }
+
+    /// Build a 32-bit sprite pattern bitmap (MSB-first) for collision tests.
+    /// Layout matches openMSX SpritePattern: bit 31 = leftmost pixel.
+    ///
+    /// For 16×16 sprites the V9938 stores four 8×8 sub-patterns in TL/BL/TR/BR
+    /// order at `pat_idx + {0, 1, 2, 3}`. Our shader uses the same ordering,
+    /// so we re-derive it here.
+    fn build_sprite_pattern_mode2(
+        &self,
+        sg_base: usize,
+        pat_idx: u8,
+        line_y: u32,
+        size16: bool,
+        mag: bool,
+    ) -> u32 {
+        let row_bits: u32 = if size16 {
+            let quad_y = (line_y >> 3) & 1;
+            let local_y = (line_y & 7) as usize;
+            let left_addr =
+                sg_base + (pat_idx as usize + quad_y as usize) * 8 + local_y;
+            let right_addr =
+                sg_base + (pat_idx as usize + 2 + quad_y as usize) * 8 + local_y;
+            let left = self.vram[left_addr & (VRAM_SIZE - 1)] as u32;
+            let right = self.vram[right_addr & (VRAM_SIZE - 1)] as u32;
+            (left << 8) | right
+        } else {
+            let addr = sg_base + (pat_idx as usize) * 8 + (line_y as usize);
+            self.vram[addr & (VRAM_SIZE - 1)] as u32
+        };
+
+        let nat_bits: u32 = if size16 { 16 } else { 8 };
+        // Place the pattern's MSB at bit 31 of u32.
+        let placed = row_bits << (32 - nat_bits);
+
+        if !mag {
+            return placed;
+        }
+
+        // Magnification: each bit doubled. openMSX's bit-twiddling for
+        // expanding an N-bit pattern in the upper N bits into a 2N-bit
+        // pattern. Works for N ≤ 16.
+        // Input must have its bits in the upper-16 region of u32 with
+        // the lower 16 zero. For 8-bit input, we further shift to that
+        // position.
+        let in_upper16 = if size16 { placed } else { row_bits << 16 };
+        let mut a = in_upper16;
+        // abcdefghijklmnop0000000000000000 → aabbccddeeffgghhiijjkkllmmnnoopp
+        a = (a | (a >> 8)) & 0xFF00FF00;
+        a = (a | (a >> 4)) & 0xF0F0F0F0;
+        a = (a | (a >> 2)) & 0xCCCCCCCC;
+        a = (a | (a >> 1)) & 0xAAAAAAAA;
+        a | (a >> 1)
+    }
+
     /// Whether the VDP is asserting its IRQ line. True when VBLANK has been
     /// raised AND register R1 bit 5 (GINT — generate interrupt) is set. Reading
     /// port 0x99 clears the VBLANK flag, which is the CPU's way of acknowledging.
@@ -622,6 +976,122 @@ impl Vdp {
         }
     }
 
+    /// TEMP DIAGNOSTIC — dump the per-scanline register bands for one frame
+    /// so we can see how a game splits the screen (mode / display page /
+    /// vertical scroll / blanking) without guessing. Opt-in via the env var
+    /// `MSX_DUMP_BANDS=1`; prints at most once every 120 frames so a normal
+    /// run stays quiet. Remove once the Quarth HUD band is understood.
+    pub fn dump_bands(&self) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static TICK: AtomicU32 = AtomicU32::new(0);
+        if std::env::var("MSX_DUMP_BANDS").is_err() {
+            return;
+        }
+        let n = TICK.fetch_add(1, Ordering::Relaxed);
+        if n % 120 != 0 {
+            return;
+        }
+
+        // Decode mode label from a snapshot's R0/R1 bits.
+        let mode_of = |r0: u8, r1: u8| -> &'static str {
+            let m1 = (r1 >> 4) & 1;
+            let m2 = (r1 >> 3) & 1;
+            let m3 = (r0 >> 1) & 1;
+            let m4 = (r0 >> 2) & 1;
+            let m5 = (r0 >> 3) & 1;
+            match (m5, m4, m3, m2, m1) {
+                (0, 0, 0, 0, 0) => "G1",
+                (0, 0, 0, 0, 1) => "T1",
+                (0, 0, 0, 1, 0) => "MC",
+                (0, 0, 1, 0, 0) => "G2",
+                (0, 1, 0, 0, 0) => "G3",
+                (0, 1, 1, 0, 0) => "G4",
+                (1, 0, 0, 0, 0) => "G5",
+                (1, 0, 1, 0, 0) => "G6",
+                (1, 1, 1, 0, 0) => "G7",
+                _ => "??",
+            }
+        };
+
+        eprintln!("--- band dump (frame {}) ---", n);
+        let mut prev: Option<(String, u8, u8, u8)> = None;
+        for (line, s) in self.scanline_snap.iter().enumerate() {
+            let mode = mode_of(s.r0, s.r1).to_string();
+            let page = (s.r2 >> 5) & 0x03; // G4 display page = R2[6:5]
+            let bl = (s.r1 >> 6) & 1; // R1 bit 6 = display enable
+            let key = (mode.clone(), page, s.r23, bl);
+            if prev.as_ref() != Some(&key) {
+                eprintln!(
+                    "  line {:>3}: mode={} page={} r23={:>3} bl={}",
+                    line, mode, page, s.r23, bl
+                );
+                prev = Some(key);
+            }
+        }
+
+        // VRAM occupancy: for each G4 page (32 KiB = 256 rows × 128 bytes),
+        // report how many of its 256 rows contain any non-zero pixel, and
+        // the first/last such row. Shows WHERE the HUD graphics actually
+        // live versus where the display split reads them from (page 1,
+        // rows 163..211).
+        // Sprite Attribute Table dump (V9938 sprite mode 2). Walk the 32
+        // entries from the frame-static R5/R11 SAT base until the Y=216
+        // sentinel, printing each sprite's Y / X / pattern and its line-0
+        // colour byte (decoding EC / CC). Lets us see which sprites Quarth
+        // defines, whether any carry CC (color-combination) — which our
+        // shader gates behind `had_prior` and may hide — and whether the
+        // "missing" ones cluster past the 8-per-line limit on a scanline.
+        let attr_base = (((self.regs[5] as usize) & 0xFC) << 7)
+            | (((self.regs[11] as usize) & 0x03) << 15);
+        let color_base = attr_base.wrapping_sub(0x200) & (VRAM_SIZE - 1);
+        let sg_base = ((self.regs[6] as usize) & 0x3F) << 11;
+        eprintln!(
+            "  SAT base={:#07x} color_base={:#07x} sg_base={:#07x} R1={:#04x}",
+            attr_base, color_base, sg_base, self.regs[1]
+        );
+        for s in 0..32usize {
+            let a = (attr_base + s * 4) & (VRAM_SIZE - 1);
+            let y = self.vram[a];
+            if y == 216 {
+                eprintln!("  spr{:>2}: Y=216 (end of list)", s);
+                break;
+            }
+            let x = self.vram[(a + 1) & (VRAM_SIZE - 1)];
+            let pat = self.vram[(a + 2) & (VRAM_SIZE - 1)];
+            let c0 = self.vram[(color_base + s * 16) & (VRAM_SIZE - 1)];
+            eprintln!(
+                "  spr{:>2}: Y={:>3} X={:>3} pat={:>3} col0={:#04x} (EC={} CC={} c={})",
+                s, y, x, pat, c0,
+                (c0 >> 7) & 1, (c0 >> 6) & 1, c0 & 0x0F
+            );
+        }
+
+        // VDP command histogram since the last dump (then reset), so we see
+        // HOW Quarth draws — LINE for the vertical bar? blits for the HUD?
+        use std::sync::atomic::Ordering::Relaxed;
+        const NAMES: [&str; 16] = [
+            "STOP", "?1", "?2", "?3", "POINT", "PSET", "SRCH", "LINE",
+            "LMMV", "LMMM", "LMCM", "LMMC", "HMMV", "HMMM", "YMMM", "HMMC",
+        ];
+        let mut parts: Vec<String> = Vec::new();
+        for (i, c) in CMD_COUNTS.iter().enumerate() {
+            let n = c.swap(0, Relaxed);
+            if n > 0 {
+                parts.push(format!("{}={}", NAMES[i], n));
+            }
+        }
+        eprintln!("  cmds: {}", parts.join(" "));
+
+        // Drain the HUD/fill blit trace collected since the last dump.
+        if let Ok(mut log) = BLIT_LOG.lock() {
+            eprintln!("  blits ({} captured):", log.len());
+            for line in log.iter() {
+                eprintln!("    {}", line);
+            }
+            log.clear();
+        }
+    }
+
     /// Fire a V9938 line interrupt: set FH (S1 bit 0) and latch the
     /// pending flag that `is_irq_pending` ORs with the VBLANK source.
     /// CPU acknowledges by reading S1 (see `read_status`).
@@ -634,8 +1104,18 @@ impl Vdp {
     /// the line interrupt should fire. Caller checks IE2 (R0 bit 4) too
     /// before actually firing.
     pub fn line_irq_target(&self, line: u8) -> bool {
-        // R19 is the line counter; matches when scanline == R19.
-        self.regs[19] == line
+        // Per fMSX MSX.c HRefresh() line-coincidence:
+        //   J = (((ScanLine + VScroll) & 0xFF) - VDP[19]) & 0xFF;
+        //   if (J == 2) { set FH; if (R0 & 0x10) fire IE1; }
+        // Two things our old `R19 == line` missed:
+        //   * VScroll (R23): the match is against the *vertically scrolled*
+        //     line, mod 256. Games like Quarth set R19 relative to the
+        //     scrolled playfield, so a split that ignores R23 drifts up/down
+        //     as the screen scrolls — exactly a "band in the wrong place".
+        //   * the +2: the coincidence fires 2 lines after the naive R19
+        //     index (VDP pipeline). `line` here is the active display line
+        //     (0 = first visible), matching fMSX's ScanLine baseline.
+        line.wrapping_add(self.regs[23]).wrapping_sub(self.regs[19]) == 2
     }
 
     /// Wipe VRAM and registers — used on cartridge swap so the BIOS can boot
@@ -795,6 +1275,14 @@ impl crate::bus::Io for Vdp {
 
 impl Vdp {
     fn read_data(&mut self) -> u8 {
+        // Per fMSX MSX.c port 0x98 read handler: reading the VRAM data
+        // port resets the address-write toggle (VKey=1). A subsequent
+        // 0x99 write is then interpreted as the FIRST byte of a new
+        // address-write sequence, not the second byte of a pending one.
+        // Without this a game that interleaves 0x99 → 0x98 → 0x99 sees
+        // its first post-data 0x99 write as completing the prior latch.
+        self.has_latched_data = false;
+
         let addr = self.full_vram_addr();
         let value = self.vram[addr];
         self.advance_vram_pointer();
@@ -832,6 +1320,11 @@ impl Vdp {
     }
 
     fn write_data(&mut self, value: u8) {
+        // Per fMSX MSX.c port 0x98 write handler: writing to the data
+        // port resets the address-write toggle (VKey=1). See read_data
+        // for the rationale.
+        self.has_latched_data = false;
+
         let addr = self.full_vram_addr();
         self.vram[addr] = value;
         self.advance_vram_pointer();
@@ -847,16 +1340,48 @@ impl Vdp {
         (addr as usize) & (VRAM_SIZE - 1)
     }
 
-    /// Increment the low 14-bit pointer, wrapping back to 0 at 0x3FFF.
-    /// We do NOT auto-increment R14 on wrap — that breaks TMS9918-style
-    /// software that does long sequential writes inside one 16 KiB bank
-    /// and expects the address to loop back to 0 within the same bank.
-    /// MSX1 software (and MSX1-compat-mode MSX2 software like Kings
-    /// Valley 2's Screen 1 paths) hits this constantly. MSX2 software
-    /// that wants to write across banks sets R14 explicitly before each
-    /// batch — which is what the V9938 documentation specifies.
+    /// Increment the low 14-bit pointer; in V9938-only display modes
+    /// also bump R14 when the pointer wraps from 0x3FFF back to 0.
+    ///
+    /// Per V9938 spec ("Accessing the Video RAM" — Setting the address
+    /// counter (A16-A14)):
+    ///
+    /// > "When data is set in [R14], and the VRAM is accessed, if
+    /// > there is a carry from A13, the data in the register is
+    /// > automatically incremented. In GRAPHIC1, GRAPHIC2, MULTICOLOR,
+    /// > and TEXT1 modes, the data in the register is not automatically
+    /// > incremented."
+    ///
+    /// This matches openMSX (VDP.cc executeCpuVramAccess). Concretely:
+    ///
+    /// - MSX1-compat modes (G1, G2, MC, T1): pointer wraps inside one
+    ///   16 KiB bank, R14 unchanged. TMS9918 software relies on this.
+    /// - V9938 modes (G3, T2, G4, G5, G6, G7): the 17-bit address rolls
+    ///   over continuously across the 128 KiB VRAM. This lets a single
+    ///   write loop fill e.g. a 32 KiB G6 bitmap without the program
+    ///   manually re-setting R14 between banks. Before this fix, every
+    ///   byte past offset 0x3FFF wrapped back to bank 0 and overwrote
+    ///   the start of the upload — explaining missing SAT entries and
+    ///   garbage colour tables for MSX2 games that put their sprite
+    ///   data in high banks.
     fn advance_vram_pointer(&mut self) {
-        self.vram_address = self.vram_address.wrapping_add(1) & 0x3FFF;
+        let new_addr = self.vram_address.wrapping_add(1) & 0x3FFF;
+        if new_addr == 0 && self.is_v9938_only_mode() {
+            self.regs[14] = self.regs[14].wrapping_add(1) & 0x07;
+        }
+        self.vram_address = new_addr;
+    }
+
+    /// True iff the current display mode is V9938-only (G3, T2, G4, G5,
+    /// G6, G7). Used to gate the R14 auto-increment behaviour.
+    ///
+    /// Mode bits M3, M4, M5 live in R0 bits 1, 2, 3 respectively.
+    /// Boundary case to watch: G2 has only M3 set (R0 bit 1 = 1) and is
+    /// TMS9918-compatible; G3 has M4 set (R0 bit 2 = 1) and is V9938-
+    /// only. So testing M4|M5 (= R0 & 0x0C) gives exactly the V9938-
+    /// only mode set without including G2.
+    fn is_v9938_only_mode(&self) -> bool {
+        (self.regs[0] & 0x0C) != 0
     }
 
     fn write_control(&mut self, value: u8) {
@@ -1095,6 +1620,32 @@ impl<'a> CmdCtx<'a> {
         }
     }
 
+    /// Write the final SY coordinate back to R34/R35 after a copy/move
+    /// command. Per fMSX (V9938.c LmmmEngine/HmmmEngine/YmmmEngine end-of-
+    /// command path): games that chain multiple commands read the SY/DY/NY
+    /// state to know where the previous command finished. Without these
+    /// writebacks chained commands restart from the original arguments.
+    fn writeback_sy(&mut self, sy: i32) {
+        self.regs[34] = sy as u8;
+        self.regs[35] = ((sy >> 8) & 0x03) as u8;
+    }
+
+    /// Write the final DY coordinate back to R38/R39 after a fill/move
+    /// command (LMMV, LMMM, HMMV, HMMM, YMMM, LMMC, HMMC, LINE).
+    fn writeback_dy(&mut self, dy: i32) {
+        self.regs[38] = dy as u8;
+        self.regs[39] = ((dy >> 8) & 0x03) as u8;
+    }
+
+    /// Write the remaining NY (typically 0 after a synchronous command) back
+    /// to R42/R43. Real V9938 leaves NY at the final loop counter, so games
+    /// reading it after the command see "rows remaining" which is normally
+    /// zero on a clean completion.
+    fn writeback_ny(&mut self, ny: i32) {
+        self.regs[42] = ny as u8;
+        self.regs[43] = ((ny >> 8) & 0x03) as u8;
+    }
+
     /// Decode a command write to R46 and run it synchronously. The high
     /// nibble of R46 is the command opcode, the low nibble is the logic
     /// operation for the L-family commands.
@@ -1106,6 +1657,7 @@ impl<'a> CmdCtx<'a> {
 
         let cmd = self.regs[46] >> 4;
         let logic_op = self.regs[46] & 0x0F;
+        CMD_COUNTS[cmd as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         match cmd {
             0x0 => self.cmd_stop(),
@@ -1170,6 +1722,9 @@ impl<'a> CmdCtx<'a> {
 
         mlog!(VDP_CMD, "HMMV dst=({},{}) {}x{} clr=0x{:02X} arg=0x{:02X}",
               dx, dy, nx, ny, clr, arg);
+        blit_log(format!(
+            "HMMV dst=({},{}) {}x{} clr={:#04x}", dx, dy, nx, ny, clr
+        ));
 
         // Y is bound by the VRAM extent, NOT by layout.height — V9938
         // software composes graphics in off-screen pages (Y > visible
@@ -1191,6 +1746,11 @@ impl<'a> CmdCtx<'a> {
                 }
             }
         }
+
+        // Post-command writeback — fMSX HmmvEngine end-of-cmd path.
+        let final_dy = dy as i32 + (ny as i32) * diy;
+        self.writeback_dy(final_dy);
+        self.writeback_ny(0);
     }
 
     /// HMMM — High-speed Move VRAM to VRAM. Byte-aligned copy.
@@ -1213,6 +1773,14 @@ impl<'a> CmdCtx<'a> {
 
         mlog!(VDP_CMD, "HMMM src=({},{}) dst=({},{}) {}x{}",
               sx, sy, dx, dy, nx, ny);
+        // Trace HUD-targeting blits (page 1 = VRAM rows 256..511) and any
+        // copy whose source/dest crosses page 1, to see how the HUD floor
+        // and the vertical bar are composed.
+        if dy >= 256 || sy >= 256 {
+            blit_log(format!(
+                "HMMM src=({},{}) dst=({},{}) {}x{}", sx, sy, dx, dy, nx, ny
+            ));
+        }
 
         for iy in 0..(ny as i32) {
             let sy_now = sy as i32 + iy * diy;
@@ -1235,6 +1803,13 @@ impl<'a> CmdCtx<'a> {
                 }
             }
         }
+
+        // Post-command writeback — fMSX HmmmEngine end-of-cmd path.
+        let final_sy = sy as i32 + (ny as i32) * diy;
+        let final_dy = dy as i32 + (ny as i32) * diy;
+        self.writeback_sy(final_sy);
+        self.writeback_dy(final_dy);
+        self.writeback_ny(0);
     }
 
     /// LMMV — Logical Move VDP to VRAM. Fill a rectangle pixel-by-pixel,
@@ -1266,6 +1841,12 @@ impl<'a> CmdCtx<'a> {
                 self.write_pixel(&layout, x as u32, y as u32, new);
             }
         }
+
+        // Post-command state writeback — match fMSX LmmvEngine end-of-cmd:
+        // DY advances by ny rows (with one extra TY when NY hits 0), NY = 0.
+        let final_dy = dy as i32 + (ny as i32) * diy;
+        self.writeback_dy(final_dy);
+        self.writeback_ny(0);
     }
 
     /// LMMM — Logical Move VRAM to VRAM. Pixel-by-pixel copy with logic
@@ -1302,6 +1883,13 @@ impl<'a> CmdCtx<'a> {
                 self.write_pixel(&layout, dx_now as u32, dy_now as u32, new);
             }
         }
+
+        // Post-command writeback — fMSX LmmmEngine end-of-cmd path.
+        let final_sy = sy as i32 + (ny as i32) * diy;
+        let final_dy = dy as i32 + (ny as i32) * diy;
+        self.writeback_sy(final_sy);
+        self.writeback_dy(final_dy);
+        self.writeback_ny(0);
     }
 
     /// PSET — set a single pixel at (DX, DY) to CLR, applying logic op.
@@ -1365,6 +1953,14 @@ impl<'a> CmdCtx<'a> {
 
         mlog!(VDP_CMD, "LINE ({},{}) maj={} nx={} ny={} clr={} dix={} diy={}",
               dx, dy, if maj_is_y { "Y" } else { "X" }, nx, ny, clr, dix, diy);
+        // TEMP DIAGNOSTIC: snapshot the most recent LINE for dump_bands.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let vals = [dx, dy, nx, ny, maj_is_y as i32, dix, diy];
+            for (slot, v) in LAST_LINE.iter().zip(vals) {
+                slot.store(v, Relaxed);
+            }
+        }
 
         let mut x = dx;
         let mut y = dy;
@@ -1396,6 +1992,10 @@ impl<'a> CmdCtx<'a> {
                 }
             }
         }
+
+        // Post-command writeback — fMSX LineEngine end-of-cmd path writes
+        // the final DY (where the line drawing stopped) back to R38/R39.
+        self.writeback_dy(y);
     }
 
     /// SRCH — Search along row SY starting at SX for the first pixel that
@@ -1415,24 +2015,33 @@ impl<'a> CmdCtx<'a> {
         mlog!(VDP_CMD, "SRCH from ({},{}) dix={} clr={} eq={}",
               sx, sy, dix, clr, eq);
 
-        // Clear previous match state (BD) before we start.
+        // Per V9938 spec §4.10.1 ("If the color is found the BD bit is set
+        // to 1") confirmed against fMSX (V9938.c SrchEngine):
+        //   - found target color → BD = 1, X stored in S8/S9
+        //   - hit the screen border first → BD = 0, search aborted
+        // Previously we had this inverted, which would cause games using
+        // SRCH for collision/edge detection to interpret results backwards.
         self.status[2] &= !0x10;
 
         let mut x = sx;
         loop {
             if x < 0 || (x as u32) >= layout.width {
-                // Hit the border without finding a match.
-                self.status[2] |= 0x10; // BD
-                mlog!(VDP_CMD, "SRCH: border at X={}", x);
+                // Border hit — BD stays cleared (already done above).
+                mlog!(VDP_CMD, "SRCH: border at X={} (BD=0)", x);
                 break;
             }
             let pixel = self.read_pixel(&layout, x as u32, sy as u32);
             let matches = if eq { pixel == clr } else { pixel != clr };
             if matches {
+                // Found the searched-for color — set BD bit and record X.
+                self.status[2] |= 0x10;
                 let xu = x as u32;
                 self.status[8] = xu as u8;
-                self.status[9] = ((xu >> 8) & 0x01) as u8;
-                mlog!(VDP_CMD, "SRCH found at X={}", xu);
+                // S9 carries only bit 0 (X8 of the X-coordinate); the upper
+                // seven bits are hardwired to 1 on real hardware per spec
+                // section 2 status registers. fMSX writes `(SX>>8) | 0xFE`.
+                self.status[9] = ((xu >> 8) as u8 & 0x01) | 0xFE;
+                mlog!(VDP_CMD, "SRCH found at X={} (BD=1)", xu);
                 break;
             }
             x += dix;
@@ -1451,28 +2060,48 @@ impl<'a> CmdCtx<'a> {
         let dy = (self.cmd_word(38) & 0x3FF) as i32;
         let ny = (self.cmd_word(42) & 0x3FF).max(1) as i32;
         let arg = self.regs[45];
+        let dix: i32 = if arg & 0x04 != 0 { -1 } else { 1 };
         let diy: i32 = if arg & 0x08 != 0 { -1 } else { 1 };
 
-        mlog!(VDP_CMD, "YMMM sy={} dx={} dy={} ny={} diy={}", sy, dx, dy, ny, diy);
+        mlog!(VDP_CMD, "YMMM sy={} dx={} dy={} ny={} dix={} diy={}", sy, dx, dy, ny, dix, diy);
 
+        // YMMM moves along Y only: source column == dest column (DX). The
+        // horizontal span runs from DX to the screen edge in the DIX
+        // direction — per fMSX YmmmEngine, which steps ADX by TX=±PPB until
+        // `(ADX += TX) & MX` crosses the row edge (MX = PPL = row width).
+        //   DIX=0 (right): byte columns [dx_byte .. pitch)
+        //   DIX=1 (left) : byte columns [0 ..= dx_byte]
+        // Previously we always copied rightward, so any left-direction YMMM
+        // scrolled the wrong half of the row into place.
         let ppb = layout.pixels_per_byte();
         let dx_byte = (dx as u32) / ppb;
-        let row_remaining = layout.pitch.saturating_sub(dx_byte);
+        let (start_col, n_cols) = if dix < 0 {
+            (0u32, dx_byte + 1)
+        } else {
+            (dx_byte, layout.pitch.saturating_sub(dx_byte))
+        };
 
         for iy in 0..ny {
             let sy_now = sy + iy * diy;
             let dy_now = dy + iy * diy;
             if sy_now < 0 || dy_now < 0 { continue; }
             // Y is unclamped — YMMM commonly scrolls off-screen rows.
-            let src_off = (sy_now as u32 * layout.pitch + dx_byte) as usize;
-            let dst_off = (dy_now as u32 * layout.pitch + dx_byte) as usize;
-            for b in 0..row_remaining as usize {
+            let src_off = (sy_now as u32 * layout.pitch + start_col) as usize;
+            let dst_off = (dy_now as u32 * layout.pitch + start_col) as usize;
+            for b in 0..n_cols as usize {
                 if src_off + b >= self.vram.len() || dst_off + b >= self.vram.len() {
                     break;
                 }
                 self.vram[dst_off + b] = self.vram[src_off + b];
             }
         }
+
+        // Post-command writeback — fMSX YmmmEngine end-of-cmd path.
+        let final_sy = sy + ny * diy;
+        let final_dy = dy + ny * diy;
+        self.writeback_sy(final_sy);
+        self.writeback_dy(final_dy);
+        self.writeback_ny(0);
     }
 
     /// LMMC — Logical Move CPU → VRAM. The command itself only sets up
@@ -1592,8 +2221,12 @@ impl<'a> CmdCtx<'a> {
         }
 
         if *self.cpu_xfer_y >= ny {
-            // Rectangle filled — transfer done.
+            // Rectangle filled — transfer done. Match fMSX end-of-cmd
+            // state writeback: final DY in R38/R39, NY=0 in R42/R43.
             mlog!(VDP_CMD, "CPU xfer write complete");
+            let final_dy = dy + (ny as i32) * diy;
+            self.writeback_dy(final_dy);
+            self.writeback_ny(0);
             *self.cpu_xfer = CpuXfer::None;
             *self.cpu_xfer_x = 0;
             *self.cpu_xfer_y = 0;
@@ -1605,8 +2238,11 @@ impl<'a> CmdCtx<'a> {
     /// currently in S7 (= the one the CPU just sees), then advances the
     /// source pointer and preloads the next pixel for the *next* read.
     fn pump_read(&mut self) -> u8 {
+        let sy = (self.cmd_word(34) & 0x3FF) as i32;
         let nx = (self.cmd_word(40) & 0x3FF).max(1);
         let ny = (self.cmd_word(42) & 0x3FF).max(1);
+        let arg = self.regs[45];
+        let diy: i32 = if arg & 0x08 != 0 { -1 } else { 1 };
 
         let pixel = self.status[7];
 
@@ -1617,7 +2253,12 @@ impl<'a> CmdCtx<'a> {
         }
 
         if *self.cpu_xfer_y >= ny {
+            // Transfer drained. fMSX LmcmEngine end-of-cmd path writes
+            // final SY (where we stopped reading) and NY=0 back.
             mlog!(VDP_CMD, "CPU xfer read complete");
+            let final_sy = sy + (ny as i32) * diy;
+            self.writeback_sy(final_sy);
+            self.writeback_ny(0);
             *self.cpu_xfer = CpuXfer::None;
             *self.cpu_xfer_x = 0;
             *self.cpu_xfer_y = 0;
@@ -1957,14 +2598,16 @@ mod tests {
             ctx.regs[46] = 0x60;
             ctx.execute();
         });
-        // S8/S9 should report X = 5; BD bit should be clear.
+        // Per V9938 spec §4.10.1: BD is SET when the searched-for color is
+        // found. S8/S9 report the X-coordinate of the match (S9 upper bits
+        // hardwired to 1).
         assert_eq!(status[8], 5);
-        assert_eq!(status[9], 0);
-        assert_eq!(status[2] & 0x10, 0, "BD must be clear on match");
+        assert_eq!(status[9], 0xFE, "S9 upper 7 bits hardwired to 1, X8=0");
+        assert_ne!(status[2] & 0x10, 0, "BD must be set on match");
     }
 
     #[test]
-    fn srch_sets_bd_on_border_hit() {
+    fn srch_clears_bd_on_border_hit() {
         let (_regs, _vram, status) = with_g4(|ctx| {
             // No matching pixel exists; search for color 5 (EQ).
             ctx.regs[32] = 0; ctx.regs[33] = 0;
@@ -1974,8 +2617,8 @@ mod tests {
             ctx.regs[46] = 0x60;
             ctx.execute();
         });
-        // Should hit the right border → BD set.
-        assert_ne!(status[2] & 0x10, 0, "BD must be set when no match found");
+        // Per spec + fMSX: border hit before match → BD cleared.
+        assert_eq!(status[2] & 0x10, 0, "BD must be clear when no match found");
     }
 
     #[test]
