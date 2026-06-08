@@ -757,7 +757,8 @@ fn shade_g4(px: u32, py: u32) -> u32 {
     // page 0, bottom on page 1, etc. Without the per-line lookup we'd
     // render every line from the LAST-written R2, missing whichever
     // band's page was active earlier.
-    let page_base = ((line_r2(py) >> 5u) & 3u) << 15u;
+    let page = (line_r2(py) >> 5u) & 3u;
+    let page_base = page << 15u;
     // R23 likewise changes per-scanline for split-screen scrolls. Wrap
     // mod 256 because a G4 page is 256 rows (32 KiB / 128 bytes/row).
     // Sprites DO follow R23 too — see sample_sprite_mode2 for the

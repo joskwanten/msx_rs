@@ -472,11 +472,19 @@ impl State {
                 vblank_fired = true;
             }
 
+            let before = self.clock.0.0;
             let _ = self.cpu.execute_next(
                 &mut self.bus,
                 &mut self.clock,
                 Option::<fn(z80emu::CpuDebug)>::None,
             );
+            // Advance the VDP command-engine busy timer by the T-states this
+            // instruction consumed, so a polled CE bit clears at the right
+            // time relative to the beam (see Vdp::tick / command_duration).
+            let dt = self.clock.0.0 - before;
+            if dt > 0 {
+                self.bus.vdp.tick(dt);
+            }
         }
 
         // Defensive: if the frame budget was so short we never reached

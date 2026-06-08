@@ -8,25 +8,6 @@
 
 use crate::mlog;
 
-/// TEMP DIAGNOSTIC: per-opcode VDP command counter (index = R46>>4), plus a
-/// capture of the most recent LINE command's parameters. Dumped and reset by
-/// `dump_bands`. Remove together with the rest of the band-dump scaffolding.
-static CMD_COUNTS: [std::sync::atomic::AtomicU32; 16] =
-    [const { std::sync::atomic::AtomicU32::new(0) }; 16];
-/// Last LINE command: [dx, dy, nx, ny, maj_is_y, dix, diy] packed loosely.
-static LAST_LINE: [std::sync::atomic::AtomicI32; 7] =
-    [const { std::sync::atomic::AtomicI32::new(0) }; 7];
-/// TEMP DIAGNOSTIC: trace of HMMV fills and HMMM blits into page 1 (the HUD),
-/// drained by `dump_bands`. Capped so it stays bounded when dumping is off.
-static BLIT_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-fn blit_log(s: String) {
-    if let Ok(mut v) = BLIT_LOG.lock() {
-        if v.len() < 80 {
-            v.push(s);
-        }
-    }
-}
-
 // 128 KiB — V9938 maximum. The shader still only reads the first 16 KiB
 // for MSX1 modes, but the command engine targets the full address space
 // via R2 (display page) and R14 (extended VRAM address bit). Keeping the
@@ -203,6 +184,17 @@ pub struct Vdp {
     /// completes, TR/CE clear, and `cpu_xfer` returns to `None`.
     cpu_xfer_x: u32,
     cpu_xfer_y: u32,
+
+    /// Remaining T-states the command engine is "busy" after a VRAM-side
+    /// command (HMMM/HMMV/YMMM/LMMV/LMMM/LINE/SRCH). We perform the VRAM
+    /// effect instantly but keep the CE status bit (S2 bit 0) set for a
+    /// realistic duration, so software that polls CE before issuing the
+    /// next command / VRAM write waits the same number of scanlines it
+    /// would on real hardware. Modelled on fMSX's VdpOpsCnt budget (each
+    /// unit of work costs `delta` cycles, 12500 per scanline). Without
+    /// this, our instant completion let Quarth race ahead of the beam and
+    /// compute its split registers / write addresses at the wrong time.
+    cmd_busy: i32,
 
     /// Set when a line interrupt has fired and the CPU hasn't yet
     /// acknowledged by reading status register S1. Combined with R0[4]
@@ -403,6 +395,7 @@ impl Vdp {
             scanline_snap: Box::new([LineSnapshot::default(); 256]),
             line_irq_pending: false,
             cpu_xfer: CpuXfer::None,
+            cmd_busy: 0,
             cpu_xfer_x: 0,
             cpu_xfer_y: 0,
             vram_buf,
@@ -413,7 +406,6 @@ impl Vdp {
     }
 
     pub fn upload(&self, queue: &wgpu::Queue, framebuffer_size: (u32, u32)) {
-        self.dump_bands(); // TEMP: opt-in via MSX_DUMP_BANDS=1
         queue.write_buffer(&self.vram_buf, 0, &self.vram[..]);
 
         // Pack R0-R23 into 6 vec4<u32> chunks. The shader needs R10/R11
@@ -976,119 +968,19 @@ impl Vdp {
         }
     }
 
-    /// TEMP DIAGNOSTIC — dump the per-scanline register bands for one frame
-    /// so we can see how a game splits the screen (mode / display page /
-    /// vertical scroll / blanking) without guessing. Opt-in via the env var
-    /// `MSX_DUMP_BANDS=1`; prints at most once every 120 frames so a normal
-    /// run stays quiet. Remove once the Quarth HUD band is understood.
-    pub fn dump_bands(&self) {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static TICK: AtomicU32 = AtomicU32::new(0);
-        if std::env::var("MSX_DUMP_BANDS").is_err() {
-            return;
-        }
-        let n = TICK.fetch_add(1, Ordering::Relaxed);
-        if n % 120 != 0 {
-            return;
-        }
-
-        // Decode mode label from a snapshot's R0/R1 bits.
-        let mode_of = |r0: u8, r1: u8| -> &'static str {
-            let m1 = (r1 >> 4) & 1;
-            let m2 = (r1 >> 3) & 1;
-            let m3 = (r0 >> 1) & 1;
-            let m4 = (r0 >> 2) & 1;
-            let m5 = (r0 >> 3) & 1;
-            match (m5, m4, m3, m2, m1) {
-                (0, 0, 0, 0, 0) => "G1",
-                (0, 0, 0, 0, 1) => "T1",
-                (0, 0, 0, 1, 0) => "MC",
-                (0, 0, 1, 0, 0) => "G2",
-                (0, 1, 0, 0, 0) => "G3",
-                (0, 1, 1, 0, 0) => "G4",
-                (1, 0, 0, 0, 0) => "G5",
-                (1, 0, 1, 0, 0) => "G6",
-                (1, 1, 1, 0, 0) => "G7",
-                _ => "??",
+    /// Advance the command-busy timer by `dt` Z80 T-states, clearing CE
+    /// (S2 bit 0) once the modelled command duration elapses. Called from
+    /// the per-instruction step loop. No-op while a CPU-streamed transfer
+    /// is active — those clear CE themselves on the final byte.
+    pub fn tick(&mut self, dt: i32) {
+        if self.cmd_busy > 0 {
+            self.cmd_busy -= dt;
+            if self.cmd_busy <= 0 {
+                self.cmd_busy = 0;
+                if self.cpu_xfer == CpuXfer::None {
+                    self.status[2] &= !0x01;
+                }
             }
-        };
-
-        eprintln!("--- band dump (frame {}) ---", n);
-        let mut prev: Option<(String, u8, u8, u8)> = None;
-        for (line, s) in self.scanline_snap.iter().enumerate() {
-            let mode = mode_of(s.r0, s.r1).to_string();
-            let page = (s.r2 >> 5) & 0x03; // G4 display page = R2[6:5]
-            let bl = (s.r1 >> 6) & 1; // R1 bit 6 = display enable
-            let key = (mode.clone(), page, s.r23, bl);
-            if prev.as_ref() != Some(&key) {
-                eprintln!(
-                    "  line {:>3}: mode={} page={} r23={:>3} bl={}",
-                    line, mode, page, s.r23, bl
-                );
-                prev = Some(key);
-            }
-        }
-
-        // VRAM occupancy: for each G4 page (32 KiB = 256 rows × 128 bytes),
-        // report how many of its 256 rows contain any non-zero pixel, and
-        // the first/last such row. Shows WHERE the HUD graphics actually
-        // live versus where the display split reads them from (page 1,
-        // rows 163..211).
-        // Sprite Attribute Table dump (V9938 sprite mode 2). Walk the 32
-        // entries from the frame-static R5/R11 SAT base until the Y=216
-        // sentinel, printing each sprite's Y / X / pattern and its line-0
-        // colour byte (decoding EC / CC). Lets us see which sprites Quarth
-        // defines, whether any carry CC (color-combination) — which our
-        // shader gates behind `had_prior` and may hide — and whether the
-        // "missing" ones cluster past the 8-per-line limit on a scanline.
-        let attr_base = (((self.regs[5] as usize) & 0xFC) << 7)
-            | (((self.regs[11] as usize) & 0x03) << 15);
-        let color_base = attr_base.wrapping_sub(0x200) & (VRAM_SIZE - 1);
-        let sg_base = ((self.regs[6] as usize) & 0x3F) << 11;
-        eprintln!(
-            "  SAT base={:#07x} color_base={:#07x} sg_base={:#07x} R1={:#04x}",
-            attr_base, color_base, sg_base, self.regs[1]
-        );
-        for s in 0..32usize {
-            let a = (attr_base + s * 4) & (VRAM_SIZE - 1);
-            let y = self.vram[a];
-            if y == 216 {
-                eprintln!("  spr{:>2}: Y=216 (end of list)", s);
-                break;
-            }
-            let x = self.vram[(a + 1) & (VRAM_SIZE - 1)];
-            let pat = self.vram[(a + 2) & (VRAM_SIZE - 1)];
-            let c0 = self.vram[(color_base + s * 16) & (VRAM_SIZE - 1)];
-            eprintln!(
-                "  spr{:>2}: Y={:>3} X={:>3} pat={:>3} col0={:#04x} (EC={} CC={} c={})",
-                s, y, x, pat, c0,
-                (c0 >> 7) & 1, (c0 >> 6) & 1, c0 & 0x0F
-            );
-        }
-
-        // VDP command histogram since the last dump (then reset), so we see
-        // HOW Quarth draws — LINE for the vertical bar? blits for the HUD?
-        use std::sync::atomic::Ordering::Relaxed;
-        const NAMES: [&str; 16] = [
-            "STOP", "?1", "?2", "?3", "POINT", "PSET", "SRCH", "LINE",
-            "LMMV", "LMMM", "LMCM", "LMMC", "HMMV", "HMMM", "YMMM", "HMMC",
-        ];
-        let mut parts: Vec<String> = Vec::new();
-        for (i, c) in CMD_COUNTS.iter().enumerate() {
-            let n = c.swap(0, Relaxed);
-            if n > 0 {
-                parts.push(format!("{}={}", NAMES[i], n));
-            }
-        }
-        eprintln!("  cmds: {}", parts.join(" "));
-
-        // Drain the HUD/fill blit trace collected since the last dump.
-        if let Ok(mut log) = BLIT_LOG.lock() {
-            eprintln!("  blits ({} captured):", log.len());
-            for line in log.iter() {
-                eprintln!("    {}", line);
-            }
-            log.clear();
         }
     }
 
@@ -1137,6 +1029,7 @@ impl Vdp {
         *self.scanline_snap = [LineSnapshot::default(); 256];
         self.line_irq_pending = false;
         self.cpu_xfer = CpuXfer::None;
+        self.cmd_busy = 0;
         self.cpu_xfer_x = 0;
         self.cpu_xfer_y = 0;
     }
@@ -1537,6 +1430,8 @@ struct CmdCtx<'a> {
     cpu_xfer: &'a mut CpuXfer,
     cpu_xfer_x: &'a mut u32,
     cpu_xfer_y: &'a mut u32,
+    /// Remaining busy T-states; set by `execute` for VRAM-side commands.
+    cmd_busy: &'a mut i32,
 }
 
 impl<'a> CmdCtx<'a> {
@@ -1657,7 +1552,6 @@ impl<'a> CmdCtx<'a> {
 
         let cmd = self.regs[46] >> 4;
         let logic_op = self.regs[46] & 0x0F;
-        CMD_COUNTS[cmd as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         match cmd {
             0x0 => self.cmd_stop(),
@@ -1678,12 +1572,48 @@ impl<'a> CmdCtx<'a> {
             }
         }
 
-        // Command done — clear CE *unless* we just set up a CPU transfer,
-        // which stays "executing" until R44 streaming completes / S7
-        // streaming drains. The pump methods clear CE on the last byte.
+        // The VRAM effect is done, but real hardware keeps the engine busy
+        // (CE = S2 bit 0) for the command's duration. We model that duration
+        // and let `Vdp::tick` clear CE once it elapses, so software that
+        // polls CE waits the right number of scanlines.
+        //
+        // Exception: a CPU-streamed transfer (LMMC/HMMC/LMCM) stays
+        // "executing" until R44 streaming completes / S7 drains — the pump
+        // methods clear CE on the last byte, and there's no fixed duration.
         if *self.cpu_xfer == CpuXfer::None {
-            self.status[2] &= !0x01;
+            let dur = self.command_duration(cmd);
+            *self.cmd_busy = dur;
+            if dur <= 0 {
+                self.status[2] &= !0x01;
+            }
         }
+    }
+
+    /// Estimate how many Z80 T-states the command engine stays busy, from
+    /// the command opcode and rectangle size. Derived from fMSX's per-unit
+    /// timing tables: each unit of work (one byte for the H-family, one
+    /// pixel for the L-family) costs `delta` engine cycles, and the engine
+    /// gets ~12500 cycles per scanline (228 T-states). So
+    /// `tstates_per_unit ≈ delta * 228 / 12500 ≈ delta / 55`. We use the
+    /// NTSC, screen-on, sprites-on column as a representative value.
+    fn command_duration(&self, cmd: u8) -> i32 {
+        let Some(layout) = self.pixel_layout() else { return 0 };
+        let ppb = layout.pixels_per_byte();
+        let nx = (self.cmd_word(40) & 0x3FF).max(1);
+        let ny = (self.cmd_word(42) & 0x3FF).max(1);
+        let nx_bytes = nx.div_ceil(ppb);
+        // (tstates_per_unit, unit_count) per command family.
+        let (per_unit, units) = match cmd {
+            0xC => (10i32, nx_bytes * ny),       // HMMV — byte fill
+            0xD => (20, nx_bytes * ny),          // HMMM — byte copy
+            0xE => (17, layout.pitch * ny),      // YMMM — full-row byte copy
+            0x8 => (21, nx * ny),                // LMMV — pixel fill
+            0x9 => (29, nx * ny),                // LMMM — pixel copy
+            0x7 => (23, nx.max(ny)),             // LINE — per major-axis step
+            0x6 => (5, nx),                      // SRCH
+            _ => (0, 0),                         // STOP/POINT/PSET — instant
+        };
+        (per_unit as i64 * units as i64).min(i32::MAX as i64) as i32
     }
 
     fn cmd_stop(&mut self) {
@@ -1708,29 +1638,32 @@ impl<'a> CmdCtx<'a> {
         };
         let dx = self.cmd_word(36) & 0x1FF;
         let dy = self.cmd_word(38) & 0x3FF;
-        let nx = (self.cmd_word(40) & 0x3FF).max(1);
-        let ny = (self.cmd_word(42) & 0x3FF).max(1);
+        let nx_raw = self.cmd_word(40) & 0x3FF;
+        let ny_raw = self.cmd_word(42) & 0x3FF;
         let clr = self.regs[44];
         let arg = self.regs[45];
         let dix: i32 = if arg & 0x04 != 0 { -1 } else { 1 };
         let diy: i32 = if arg & 0x08 != 0 { -1 } else { 1 };
 
         let ppb = layout.pixels_per_byte();
-        // Convert pixel-X to byte-X. HMMV is byte-granular.
+        // Convert pixel-X to byte-X. HMMV is byte-granular. NX=0 / NY=0 mean
+        // "run to the screen edge", same as HMMM — see cmd_hmmm for why.
         let dx_byte = (dx as i32) / (ppb as i32);
-        let nx_bytes = nx.div_ceil(ppb) as i32;
+        let nx_bytes: i32 = if nx_raw == 0 {
+            if dix < 0 { dx_byte + 1 } else { layout.pitch as i32 - dx_byte }
+        } else {
+            (nx_raw.div_ceil(ppb)) as i32
+        };
+        let ny = if ny_raw == 0 { 1024 } else { ny_raw as i32 };
 
         mlog!(VDP_CMD, "HMMV dst=({},{}) {}x{} clr=0x{:02X} arg=0x{:02X}",
-              dx, dy, nx, ny, clr, arg);
-        blit_log(format!(
-            "HMMV dst=({},{}) {}x{} clr={:#04x}", dx, dy, nx, ny, clr
-        ));
+              dx, dy, nx_raw, ny, clr, arg);
 
         // Y is bound by the VRAM extent, NOT by layout.height — V9938
         // software composes graphics in off-screen pages (Y > visible
         // height) and then transfers them to the displayed page via
         // LMMM/HMMM. Same for the read/write commands below.
-        for iy in 0..(ny as i32) {
+        for iy in 0..ny {
             let y = dy as i32 + iy * diy;
             if y < 0 {
                 continue;
@@ -1748,7 +1681,7 @@ impl<'a> CmdCtx<'a> {
         }
 
         // Post-command writeback — fMSX HmmvEngine end-of-cmd path.
-        let final_dy = dy as i32 + (ny as i32) * diy;
+        let final_dy = dy as i32 + ny * diy;
         self.writeback_dy(final_dy);
         self.writeback_ny(0);
     }
@@ -1760,8 +1693,8 @@ impl<'a> CmdCtx<'a> {
         let sy = self.cmd_word(34) & 0x3FF;
         let dx = self.cmd_word(36) & 0x1FF;
         let dy = self.cmd_word(38) & 0x3FF;
-        let nx = (self.cmd_word(40) & 0x3FF).max(1);
-        let ny = (self.cmd_word(42) & 0x3FF).max(1);
+        let nx_raw = self.cmd_word(40) & 0x3FF;
+        let ny_raw = self.cmd_word(42) & 0x3FF;
         let arg = self.regs[45];
         let dix: i32 = if arg & 0x04 != 0 { -1 } else { 1 };
         let diy: i32 = if arg & 0x08 != 0 { -1 } else { 1 };
@@ -1769,20 +1702,28 @@ impl<'a> CmdCtx<'a> {
         let ppb = layout.pixels_per_byte();
         let sx_byte = (sx as i32) / (ppb as i32);
         let dx_byte = (dx as i32) / (ppb as i32);
-        let nx_bytes = nx.div_ceil(ppb) as i32;
+        // NX=0 / NY=0 mean "run to the screen edge", not zero-size. fMSX
+        // models this via the ANX/NY counter underflow in `post_xxyy`: the
+        // row/column-end condition never trips on the count, so the copy
+        // continues until the source OR destination reaches the row edge
+        // (NX) / wraps (NY). Quarth draws its full-width HUD floor with a
+        // single NX=0 HMMM — our old `.max(1)` clamped it to one byte,
+        // leaving the floor unwritten (the "demo bleed" background).
+        let nx_bytes: i32 = if nx_raw == 0 {
+            if dix < 0 {
+                sx_byte.min(dx_byte) + 1
+            } else {
+                layout.pitch as i32 - sx_byte.max(dx_byte)
+            }
+        } else {
+            (nx_raw.div_ceil(ppb)) as i32
+        };
+        let ny = if ny_raw == 0 { 1024 } else { ny_raw as i32 };
 
-        mlog!(VDP_CMD, "HMMM src=({},{}) dst=({},{}) {}x{}",
-              sx, sy, dx, dy, nx, ny);
-        // Trace HUD-targeting blits (page 1 = VRAM rows 256..511) and any
-        // copy whose source/dest crosses page 1, to see how the HUD floor
-        // and the vertical bar are composed.
-        if dy >= 256 || sy >= 256 {
-            blit_log(format!(
-                "HMMM src=({},{}) dst=({},{}) {}x{}", sx, sy, dx, dy, nx, ny
-            ));
-        }
+        mlog!(VDP_CMD, "HMMM src=({},{}) dst=({},{}) {}x{} (nxb={})",
+              sx, sy, dx, dy, nx_raw, ny, nx_bytes);
 
-        for iy in 0..(ny as i32) {
+        for iy in 0..ny {
             let sy_now = sy as i32 + iy * diy;
             let dy_now = dy as i32 + iy * diy;
             if sy_now < 0 || dy_now < 0 { continue; }
@@ -1805,8 +1746,8 @@ impl<'a> CmdCtx<'a> {
         }
 
         // Post-command writeback — fMSX HmmmEngine end-of-cmd path.
-        let final_sy = sy as i32 + (ny as i32) * diy;
-        let final_dy = dy as i32 + (ny as i32) * diy;
+        let final_sy = sy as i32 + ny * diy;
+        let final_dy = dy as i32 + ny * diy;
         self.writeback_sy(final_sy);
         self.writeback_dy(final_dy);
         self.writeback_ny(0);
@@ -1820,20 +1761,27 @@ impl<'a> CmdCtx<'a> {
         let Some(layout) = self.pixel_layout() else { return };
         let dx = self.cmd_word(36) & 0x1FF;
         let dy = self.cmd_word(38) & 0x3FF;
-        let nx = (self.cmd_word(40) & 0x3FF).max(1);
-        let ny = (self.cmd_word(42) & 0x3FF).max(1);
+        let nx_raw = self.cmd_word(40) & 0x3FF;
+        let ny_raw = self.cmd_word(42) & 0x3FF;
         let clr = self.regs[44] & layout.pixel_mask();
         let arg = self.regs[45];
         let dix: i32 = if arg & 0x04 != 0 { -1 } else { 1 };
         let diy: i32 = if arg & 0x08 != 0 { -1 } else { 1 };
+        // NX=0 / NY=0 run to the edge (pixel-granular here) — see cmd_hmmm.
+        let nx = if nx_raw == 0 {
+            if dix < 0 { dx as i32 + 1 } else { layout.width as i32 - dx as i32 }
+        } else {
+            nx_raw as i32
+        };
+        let ny = if ny_raw == 0 { 1024 } else { ny_raw as i32 };
 
         mlog!(VDP_CMD, "LMMV dst=({},{}) {}x{} clr={} op=0x{:X}",
               dx, dy, nx, ny, clr, logic_op);
 
-        for iy in 0..(ny as i32) {
+        for iy in 0..ny {
             let y = dy as i32 + iy * diy;
             if y < 0 { continue; }
-            for ix in 0..(nx as i32) {
+            for ix in 0..nx {
                 let x = dx as i32 + ix * dix;
                 if x < 0 || x as u32 >= layout.width { continue; }
                 let dst = self.read_pixel(&layout, x as u32, y as u32);
@@ -1844,7 +1792,7 @@ impl<'a> CmdCtx<'a> {
 
         // Post-command state writeback — match fMSX LmmvEngine end-of-cmd:
         // DY advances by ny rows (with one extra TY when NY hits 0), NY = 0.
-        let final_dy = dy as i32 + (ny as i32) * diy;
+        let final_dy = dy as i32 + ny * diy;
         self.writeback_dy(final_dy);
         self.writeback_ny(0);
     }
@@ -1857,22 +1805,34 @@ impl<'a> CmdCtx<'a> {
         let sy = self.cmd_word(34) & 0x3FF;
         let dx = self.cmd_word(36) & 0x1FF;
         let dy = self.cmd_word(38) & 0x3FF;
-        let nx = (self.cmd_word(40) & 0x3FF).max(1);
-        let ny = (self.cmd_word(42) & 0x3FF).max(1);
+        let nx_raw = self.cmd_word(40) & 0x3FF;
+        let ny_raw = self.cmd_word(42) & 0x3FF;
         let arg = self.regs[45];
         let dix: i32 = if arg & 0x04 != 0 { -1 } else { 1 };
         let diy: i32 = if arg & 0x08 != 0 { -1 } else { 1 };
+        // NX=0 / NY=0 run to the edge — copy stops when source OR dest
+        // reaches the row edge (see cmd_hmmm).
+        let nx = if nx_raw == 0 {
+            if dix < 0 {
+                (sx.min(dx) as i32) + 1
+            } else {
+                layout.width as i32 - sx.max(dx) as i32
+            }
+        } else {
+            nx_raw as i32
+        };
+        let ny = if ny_raw == 0 { 1024 } else { ny_raw as i32 };
 
         mlog!(VDP_CMD, "LMMM src=({},{}) dst=({},{}) {}x{} op=0x{:X}",
               sx, sy, dx, dy, nx, ny, logic_op);
 
-        for iy in 0..(ny as i32) {
+        for iy in 0..ny {
             let sy_now = sy as i32 + iy * diy;
             let dy_now = dy as i32 + iy * diy;
             if sy_now < 0 || dy_now < 0 { continue; }
             // No layout.height clamp — see HMMV / HMMM. Off-screen pages
             // are routinely used as source for sprite/tile composition.
-            for ix in 0..(nx as i32) {
+            for ix in 0..nx {
                 let sx_now = sx as i32 + ix * dix;
                 let dx_now = dx as i32 + ix * dix;
                 if sx_now < 0 || dx_now < 0 { continue; }
@@ -1885,8 +1845,8 @@ impl<'a> CmdCtx<'a> {
         }
 
         // Post-command writeback — fMSX LmmmEngine end-of-cmd path.
-        let final_sy = sy as i32 + (ny as i32) * diy;
-        let final_dy = dy as i32 + (ny as i32) * diy;
+        let final_sy = sy as i32 + ny * diy;
+        let final_dy = dy as i32 + ny * diy;
         self.writeback_sy(final_sy);
         self.writeback_dy(final_dy);
         self.writeback_ny(0);
@@ -1953,14 +1913,6 @@ impl<'a> CmdCtx<'a> {
 
         mlog!(VDP_CMD, "LINE ({},{}) maj={} nx={} ny={} clr={} dix={} diy={}",
               dx, dy, if maj_is_y { "Y" } else { "X" }, nx, ny, clr, dix, diy);
-        // TEMP DIAGNOSTIC: snapshot the most recent LINE for dump_bands.
-        {
-            use std::sync::atomic::Ordering::Relaxed;
-            let vals = [dx, dy, nx, ny, maj_is_y as i32, dix, diy];
-            for (slot, v) in LAST_LINE.iter().zip(vals) {
-                slot.store(v, Relaxed);
-            }
-        }
 
         let mut x = dx;
         let mut y = dy;
@@ -2283,6 +2235,7 @@ impl Vdp {
             cpu_xfer: &mut self.cpu_xfer,
             cpu_xfer_x: &mut self.cpu_xfer_x,
             cpu_xfer_y: &mut self.cpu_xfer_y,
+            cmd_busy: &mut self.cmd_busy,
         };
         ctx.execute();
     }
@@ -2302,6 +2255,7 @@ impl Vdp {
             cpu_xfer: &mut self.cpu_xfer,
             cpu_xfer_x: &mut self.cpu_xfer_x,
             cpu_xfer_y: &mut self.cpu_xfer_y,
+            cmd_busy: &mut self.cmd_busy,
         };
         ctx.pump_write(value);
     }
@@ -2321,6 +2275,7 @@ impl Vdp {
             cpu_xfer: &mut self.cpu_xfer,
             cpu_xfer_x: &mut self.cpu_xfer_x,
             cpu_xfer_y: &mut self.cpu_xfer_y,
+            cmd_busy: &mut self.cmd_busy,
         };
         ctx.pump_read()
     }
