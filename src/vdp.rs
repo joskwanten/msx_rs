@@ -98,18 +98,29 @@ struct Uniforms {
     // wider-mask V9938 shading paths. Command-engine regs R32-R46 stay on
     // the CPU side because the engine runs there.
     regs: [[u32; 4]; 6],
-    // Per-scanline snapshots of R5 (SAT base), R6 (sprite pattern table),
-    // R11 (SAT high bits) and R23 (vertical scroll) — the registers that
-    // V9938 games typically rewrite from a line-interrupt handler each
-    // scanline (split-screen scrolls, multiple SATs, etc.). 256 entries
-    // × 1 u32 per scanline, packed as four bytes:
+    // Per-scanline snapshots of R5/R6/R11/R23, packed:
     //   bits  0..7  = R5
     //   bits  8..15 = R6
     //   bits 16..23 = R11
     //   bits 24..31 = R23
-    // Packed 4 scanlines per vec4 → 64 vec4 = 1 KiB total. Plenty under
-    // any uniform-buffer-size limit.
+    // 256 entries × 1 u32, 4 scanlines per vec4 → 64 vec4 = 1 KiB.
     scanline_regs: [[u32; 4]; 64],
+    // Second per-scanline array, packed:
+    //   bits  0..7  = R2  (display page selector)
+    //   bits  8..15 = R0  (mode bits M3/M4/M5 + IE2)
+    //   bits 16..23 = R1  (mode bits M1/M2 + display enable)
+    //   bits 24..31 = R7  (backdrop colour for border cycling)
+    // Same per-vec4 layout (4 scanlines per vec4). Lets the shader's
+    // mode dispatch swap rendering paths mid-frame (KV2's score area
+    // is G1 text below a G4 playfield; Vampire Killer does the same).
+    scanline_regs2: [[u32; 4]; 64],
+    // Third per-scanline array — table-base registers that vary when
+    // software flips between bitmap and tile modes in different bands:
+    //   bits  0..7  = R3  (colour table base, low byte)
+    //   bits  8..15 = R4  (pattern generator table base)
+    //   bits 16..23 = R10 (colour table extension, G3+ high address bits)
+    //   bits 24..31 = reserved
+    scanline_regs3: [[u32; 4]; 64],
     palette: [[f32; 4]; 16],
 }
 
@@ -162,6 +173,18 @@ pub struct Vdp {
     /// sprite tables render correctly.
     pub scanline_snap: Box<[LineSnapshot; 256]>,
 
+    /// Active CPU-driven command-engine transfer, if any. LMMC/HMMC stream
+    /// pixels FROM the CPU into VRAM (via writes to R44); LMCM streams
+    /// pixels FROM VRAM to the CPU (via reads of status register S7).
+    /// Persists across many instructions — each R44 write / S7 read
+    /// transfers exactly one pixel or byte.
+    cpu_xfer: CpuXfer,
+    /// Per-pixel transfer counters: X advances on each pixel, wraps to 0
+    /// and increments Y when it reaches NX. When Y reaches NY the transfer
+    /// completes, TR/CE clear, and `cpu_xfer` returns to `None`.
+    cpu_xfer_x: u32,
+    cpu_xfer_y: u32,
+
     /// Set when a line interrupt has fired and the CPU hasn't yet
     /// acknowledged by reading status register S1. Combined with R0[4]
     /// (IE2) by `is_irq_pending` so the CPU's IRQ line goes high.
@@ -177,12 +200,60 @@ pub struct Vdp {
 /// captured at the start of each visible scanline so the shader can
 /// reproduce split-screen scrolls and per-band sprite tables. See the
 /// `Vdp.scanline_snap` field for the full story.
+///
+/// Currently tracked:
+///   r0  — mode bits M3/M4/M5 + IE2 (mode-switch per band)
+///   r1  — mode bits M1/M2 + display enable + IE1
+///   r2  — name/pattern table base (page selector in G4: bits 6:5)
+///   r3  — colour table base (low byte)
+///   r4  — pattern generator table base
+///   r5  — sprite attribute table base
+///   r6  — sprite pattern table base
+///   r7  — backdrop colour (border colour cycling)
+///   r10 — colour table base extension (G3+, address bits 16:14)
+///   r11 — SAT high bits (extended VRAM addressing)
+///   r23 — vertical scroll
 #[derive(Copy, Clone, Default)]
 pub struct LineSnapshot {
+    pub r0: u8,
+    pub r1: u8,
+    pub r2: u8,
+    pub r3: u8,
+    pub r4: u8,
     pub r5: u8,
     pub r6: u8,
+    pub r7: u8,
+    pub r10: u8,
     pub r11: u8,
     pub r23: u8,
+}
+
+/// Active CPU-streamed command-engine transfer. The V9938 has three of
+/// these; LMMC and HMMC pump CPU → VRAM (data arrives via R44 writes),
+/// LMCM pumps VRAM → CPU (data is read from status register S7). Each
+/// pump advances the (X, Y) counters in the parent `Vdp` and clears
+/// itself when the rectangle is full.
+#[derive(Copy, Clone, PartialEq)]
+pub enum CpuXfer {
+    /// No active CPU transfer; R44 / S7 behave as plain registers.
+    None,
+    /// Logical Move CPU → VRAM. Each R44 write supplies one *pixel*
+    /// (low bits of `value`, masked to mode bpp). Applies the logic
+    /// operation that was attached to the command's R46 byte.
+    Lmmc { logic_op: u8 },
+    /// High-speed Move CPU → VRAM. Each R44 write supplies one *byte*
+    /// (multiple pixels in 4 bpp / 2 bpp modes) written verbatim to
+    /// VRAM — no logic op, no per-pixel work.
+    Hmmc,
+    /// Logical Move VRAM → CPU. Each S7 read returns one pixel and
+    /// auto-advances the source pointer.
+    Lmcm,
+}
+
+impl Default for CpuXfer {
+    fn default() -> Self {
+        CpuXfer::None
+    }
 }
 
 /// Convert a 3-bit-per-channel V9938 palette colour to the same vec4<f32>
@@ -312,6 +383,9 @@ impl Vdp {
             palette_pending: None,
             scanline_snap: Box::new([LineSnapshot::default(); 256]),
             line_irq_pending: false,
+            cpu_xfer: CpuXfer::None,
+            cpu_xfer_x: 0,
+            cpu_xfer_y: 0,
             vram_buf,
             uniform_buf,
             bind_group,
@@ -331,17 +405,28 @@ impl Vdp {
             regs_packed[i / 4][i % 4] = b as u32;
         }
 
-        // Pack the 256 per-scanline snapshots into 64 vec4<u32>. Each u32
-        // holds the four mutable registers for one scanline (R5, R6, R11,
-        // R23 in low-to-high byte order), and each vec4 holds four
-        // consecutive scanlines.
+        // Pack the 256 per-scanline snapshots. First array holds R5/R6/
+        // R11/R23 (4 bytes per scanline, 4 scanlines per vec4). Second
+        // array holds R2 (1 byte per scanline) with the other 3 bytes
+        // reserved.
         let mut scanline_packed = [[0u32; 4]; 64];
+        let mut scanline_packed2 = [[0u32; 4]; 64];
+        let mut scanline_packed3 = [[0u32; 4]; 64];
         for (line, snap) in self.scanline_snap.iter().enumerate() {
             let packed = (snap.r5 as u32)
                 | ((snap.r6 as u32) << 8)
                 | ((snap.r11 as u32) << 16)
                 | ((snap.r23 as u32) << 24);
             scanline_packed[line / 4][line % 4] = packed;
+            let packed2 = (snap.r2 as u32)
+                | ((snap.r0 as u32) << 8)
+                | ((snap.r1 as u32) << 16)
+                | ((snap.r7 as u32) << 24);
+            scanline_packed2[line / 4][line % 4] = packed2;
+            let packed3 = (snap.r3 as u32)
+                | ((snap.r4 as u32) << 8)
+                | ((snap.r10 as u32) << 16);
+            scanline_packed3[line / 4][line % 4] = packed3;
         }
 
         let uniforms = Uniforms {
@@ -349,6 +434,8 @@ impl Vdp {
             _pad: [0; 2],
             regs: regs_packed,
             scanline_regs: scanline_packed,
+            scanline_regs2: scanline_packed2,
+            scanline_regs3: scanline_packed3,
             palette: self.palette,
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
@@ -371,6 +458,18 @@ impl Vdp {
     pub fn start_vblank(&mut self) {
         self.update_sprite_status();
         self.status[0] |= 0x80;
+        // S2 bit 6 (VR) = "vertical retrace in progress". Beam-racing
+        // V9938 code polls this to detect the start of VBlank rather
+        // than (or alongside) the IRQ. Cleared at the top of the next
+        // frame's visible scan-out by `clear_vblank_flag`.
+        self.status[2] |= 0x40;
+    }
+
+    /// Clear S2 bit 6 (VR), called at the start of a new frame's visible
+    /// scan-out so beam-racing software sees the right "vertical
+    /// retrace" edge.
+    pub fn clear_vblank_flag(&mut self) {
+        self.status[2] &= !0x40;
     }
 
     /// Compute the per-frame sprite-related status bits:
@@ -508,8 +607,15 @@ impl Vdp {
     pub fn snapshot_scanline(&mut self, line: usize) {
         if line < self.scanline_snap.len() {
             self.scanline_snap[line] = LineSnapshot {
+                r0: self.regs[0],
+                r1: self.regs[1],
+                r2: self.regs[2],
+                r3: self.regs[3],
+                r4: self.regs[4],
                 r5: self.regs[5],
                 r6: self.regs[6],
+                r7: self.regs[7],
+                r10: self.regs[10],
                 r11: self.regs[11],
                 r23: self.regs[23],
             };
@@ -550,6 +656,9 @@ impl Vdp {
         self.palette_pending = None;
         *self.scanline_snap = [LineSnapshot::default(); 256];
         self.line_irq_pending = false;
+        self.cpu_xfer = CpuXfer::None;
+        self.cpu_xfer_x = 0;
+        self.cpu_xfer_y = 0;
     }
 
     /// Current backdrop colour as a 4-component RGBA value in the same space
@@ -712,6 +821,11 @@ impl Vdp {
                 self.line_irq_pending = false;
                 v
             }
+            // S7 has a side effect during LMCM: each read returns the
+            // next pixel and advances the source pointer. Outside of an
+            // LMCM transfer it's just a plain status register (e.g. the
+            // colour latched by POINT).
+            7 => self.pump_cpu_xfer_read(),
             n if n < self.status.len() => self.status[n],
             _ => 0xFF, // S10-S15 unused on V9938
         }
@@ -780,6 +894,12 @@ impl Vdp {
         self.regs[reg] = value;
         if reg == 46 {
             self.execute_command();
+        }
+        // R44 is the command-engine colour register; writing to it during
+        // an active LMMC / HMMC streams one more pixel / byte through the
+        // transfer pipeline.
+        if reg == 44 {
+            self.pump_cpu_xfer_write(value);
         }
     }
 
@@ -886,6 +1006,12 @@ struct CmdCtx<'a> {
     regs: &'a mut [u8; 64],
     vram: &'a mut [u8],
     status: &'a mut [u8; 10],
+    /// CPU-streamed transfer state — initialised by the LMMC/HMMC/LMCM
+    /// command handlers and stepped by `pump_write` (called from R44
+    /// writes) or `pump_read` (called from S7 reads).
+    cpu_xfer: &'a mut CpuXfer,
+    cpu_xfer_x: &'a mut u32,
+    cpu_xfer_y: &'a mut u32,
 }
 
 impl<'a> CmdCtx<'a> {
@@ -989,16 +1115,9 @@ impl<'a> CmdCtx<'a> {
             0x7 => self.cmd_line(logic_op),
             0x8 => self.cmd_lmmv(logic_op),
             0x9 => self.cmd_lmmm(logic_op),
-            0xA | 0xB | 0xF => {
-                // LMCM / LMMC / HMMC — CPU transfers. Not implemented in
-                // this pass; they need a between-instructions byte pump
-                // through R44 (writes) or S7 (reads) plus persistent
-                // counters that survive the command-write boundary, which
-                // doesn't fit a borrowed-state `CmdCtx`. Stubbed so games
-                // that issue them don't crash — they just see TR/CE
-                // clear immediately and write zero bytes.
-                mlog!(VDP_CMD, "CPU transfer cmd 0x{:X} stubbed", cmd);
-            }
+            0xA => self.cmd_lmcm(),
+            0xB => self.cmd_lmmc(logic_op),
+            0xF => self.cmd_hmmc(),
             0xC => self.cmd_hmmv(),
             0xD => self.cmd_hmmm(),
             0xE => self.cmd_ymmm(),
@@ -1007,14 +1126,24 @@ impl<'a> CmdCtx<'a> {
             }
         }
 
-        // Command done.
-        self.status[2] &= !0x01;
+        // Command done — clear CE *unless* we just set up a CPU transfer,
+        // which stays "executing" until R44 streaming completes / S7
+        // streaming drains. The pump methods clear CE on the last byte.
+        if *self.cpu_xfer == CpuXfer::None {
+            self.status[2] &= !0x01;
+        }
     }
 
     fn cmd_stop(&mut self) {
         mlog!(VDP_CMD, "STOP");
-        // Real hardware aborts any pending command. We're already
-        // synchronous, so nothing to abort — just clear CE in the caller.
+        // Abort any active CPU transfer so the next R44 write / S7 read
+        // doesn't pump into stale state. The CE-clear at the end of
+        // `execute` then takes effect because cpu_xfer is back to None.
+        *self.cpu_xfer = CpuXfer::None;
+        *self.cpu_xfer_x = 0;
+        *self.cpu_xfer_y = 0;
+        // Status bits: clear TR (transfer ready). CE clears in `execute`.
+        self.status[2] &= !0x80;
     }
 
     /// HMMV — High-speed Move VDP to VRAM. Fill a byte-aligned rectangle
@@ -1345,6 +1474,161 @@ impl<'a> CmdCtx<'a> {
             }
         }
     }
+
+    /// LMMC — Logical Move CPU → VRAM. The command itself only sets up
+    /// the destination rectangle and the active transfer state; the
+    /// actual pixels arrive one-at-a-time via subsequent CPU writes to
+    /// R44, each pumped through `pump_write`.
+    fn cmd_lmmc(&mut self, logic_op: u8) {
+        mlog!(VDP_CMD, "LMMC start logic_op=0x{:X}", logic_op);
+        *self.cpu_xfer = CpuXfer::Lmmc { logic_op };
+        *self.cpu_xfer_x = 0;
+        *self.cpu_xfer_y = 0;
+        // TR = transfer ready (CPU may write the first pixel).
+        // CE = command executing (stays set until the rectangle is full).
+        self.status[2] |= 0x81;
+    }
+
+    /// HMMC — High-speed Move CPU → VRAM. Like LMMC but byte-granular:
+    /// each CPU byte is written directly to VRAM (no pixel masking, no
+    /// logic op). Used to stream pre-packed bitmap data fast.
+    fn cmd_hmmc(&mut self) {
+        mlog!(VDP_CMD, "HMMC start");
+        *self.cpu_xfer = CpuXfer::Hmmc;
+        *self.cpu_xfer_x = 0;
+        *self.cpu_xfer_y = 0;
+        self.status[2] |= 0x81;
+    }
+
+    /// LMCM — Logical Move VRAM → CPU. CPU drains pixels by reading
+    /// status register S7; each read returns the current pixel and
+    /// advances the source pointer.
+    fn cmd_lmcm(&mut self) {
+        mlog!(VDP_CMD, "LMCM start");
+        *self.cpu_xfer = CpuXfer::Lmcm;
+        *self.cpu_xfer_x = 0;
+        *self.cpu_xfer_y = 0;
+        // Pre-load the first pixel into S7 so the CPU's first S7 read
+        // returns valid data before any pump.
+        self.preload_lmcm_pixel();
+        self.status[2] |= 0x81;
+    }
+
+    /// Compute the next LMCM source pixel and stash it in S7.
+    fn preload_lmcm_pixel(&mut self) {
+        let Some(layout) = self.pixel_layout() else {
+            return;
+        };
+        let sx = (self.cmd_word(32) & 0x1FF) as i32;
+        let sy = (self.cmd_word(34) & 0x3FF) as i32;
+        let arg = self.regs[45];
+        let dix: i32 = if arg & 0x04 != 0 { -1 } else { 1 };
+        let diy: i32 = if arg & 0x08 != 0 { -1 } else { 1 };
+        let x = sx + (*self.cpu_xfer_x as i32) * dix;
+        let y = sy + (*self.cpu_xfer_y as i32) * diy;
+        if x >= 0 && y >= 0 && (x as u32) < layout.width {
+            self.status[7] = self.read_pixel(&layout, x as u32, y as u32);
+        } else {
+            self.status[7] = 0;
+        }
+    }
+
+    /// Advance one step of an active CPU → VRAM transfer. Called from
+    /// `Vdp::write_register` whenever the CPU writes to R44 *and* a
+    /// transfer is active. Handles the pixel-level work for LMMC and the
+    /// byte-level work for HMMC; auto-clears TR/CE on the final write.
+    fn pump_write(&mut self, value: u8) {
+        let kind = *self.cpu_xfer;
+        let Some(layout) = self.pixel_layout() else {
+            return;
+        };
+        let dx = (self.cmd_word(36) & 0x1FF) as i32;
+        let dy = (self.cmd_word(38) & 0x3FF) as i32;
+        let nx = (self.cmd_word(40) & 0x3FF).max(1);
+        let ny = (self.cmd_word(42) & 0x3FF).max(1);
+        let arg = self.regs[45];
+        let dix: i32 = if arg & 0x04 != 0 { -1 } else { 1 };
+        let diy: i32 = if arg & 0x08 != 0 { -1 } else { 1 };
+
+        match kind {
+            CpuXfer::Lmmc { logic_op } => {
+                // One pixel per write: low bits of `value` masked to bpp.
+                let x = dx + (*self.cpu_xfer_x as i32) * dix;
+                let y = dy + (*self.cpu_xfer_y as i32) * diy;
+                if x >= 0 && y >= 0 && (x as u32) < layout.width {
+                    let src = value & layout.pixel_mask();
+                    let dst = self.read_pixel(&layout, x as u32, y as u32);
+                    let new = apply_logic_op(src, dst, logic_op, layout.pixel_mask());
+                    self.write_pixel(&layout, x as u32, y as u32, new);
+                }
+                *self.cpu_xfer_x += 1;
+                if *self.cpu_xfer_x >= nx {
+                    *self.cpu_xfer_x = 0;
+                    *self.cpu_xfer_y += 1;
+                }
+            }
+            CpuXfer::Hmmc => {
+                // One byte per write — `nx` is in pixels so we advance
+                // by `pixels_per_byte` per iteration.
+                let ppb = layout.pixels_per_byte();
+                let dx_byte = (dx as u32) / ppb;
+                let bx = dx_byte as i32 + (*self.cpu_xfer_x as i32) * dix;
+                let y = dy + (*self.cpu_xfer_y as i32) * diy;
+                if bx >= 0 && y >= 0 && (bx as u32) < layout.pitch {
+                    let addr = (y as u32 * layout.pitch + bx as u32) as usize;
+                    if addr < self.vram.len() {
+                        self.vram[addr] = value;
+                    }
+                }
+                *self.cpu_xfer_x += 1;
+                // HMMC advances by one byte-stride per write, so the
+                // row's worth of bytes is nx / pixels_per_byte.
+                if *self.cpu_xfer_x >= nx.div_ceil(ppb) {
+                    *self.cpu_xfer_x = 0;
+                    *self.cpu_xfer_y += 1;
+                }
+            }
+            _ => return,
+        }
+
+        if *self.cpu_xfer_y >= ny {
+            // Rectangle filled — transfer done.
+            mlog!(VDP_CMD, "CPU xfer write complete");
+            *self.cpu_xfer = CpuXfer::None;
+            *self.cpu_xfer_x = 0;
+            *self.cpu_xfer_y = 0;
+            self.status[2] &= !0x81; // Clear TR and CE.
+        }
+    }
+
+    /// Advance one step of an active LMCM transfer. Returns the pixel
+    /// currently in S7 (= the one the CPU just sees), then advances the
+    /// source pointer and preloads the next pixel for the *next* read.
+    fn pump_read(&mut self) -> u8 {
+        let nx = (self.cmd_word(40) & 0x3FF).max(1);
+        let ny = (self.cmd_word(42) & 0x3FF).max(1);
+
+        let pixel = self.status[7];
+
+        *self.cpu_xfer_x += 1;
+        if *self.cpu_xfer_x >= nx {
+            *self.cpu_xfer_x = 0;
+            *self.cpu_xfer_y += 1;
+        }
+
+        if *self.cpu_xfer_y >= ny {
+            mlog!(VDP_CMD, "CPU xfer read complete");
+            *self.cpu_xfer = CpuXfer::None;
+            *self.cpu_xfer_x = 0;
+            *self.cpu_xfer_y = 0;
+            self.status[2] &= !0x81;
+        } else {
+            // Preload the next pixel so the next S7 read sees fresh data.
+            self.preload_lmcm_pixel();
+        }
+
+        pixel
+    }
 }
 
 impl Vdp {
@@ -1355,8 +1639,49 @@ impl Vdp {
             regs: &mut self.regs,
             vram: &mut self.vram[..],
             status: &mut self.status,
+            cpu_xfer: &mut self.cpu_xfer,
+            cpu_xfer_x: &mut self.cpu_xfer_x,
+            cpu_xfer_y: &mut self.cpu_xfer_y,
         };
         ctx.execute();
+    }
+
+    /// Called when the CPU writes to R44. If a CPU → VRAM transfer
+    /// (LMMC / HMMC) is active, this advances the transfer by one pixel
+    /// (LMMC) or one byte (HMMC); otherwise it's a no-op and R44 keeps
+    /// the value just written.
+    fn pump_cpu_xfer_write(&mut self, value: u8) {
+        if self.cpu_xfer == CpuXfer::None {
+            return;
+        }
+        let mut ctx = CmdCtx {
+            regs: &mut self.regs,
+            vram: &mut self.vram[..],
+            status: &mut self.status,
+            cpu_xfer: &mut self.cpu_xfer,
+            cpu_xfer_x: &mut self.cpu_xfer_x,
+            cpu_xfer_y: &mut self.cpu_xfer_y,
+        };
+        ctx.pump_write(value);
+    }
+
+    /// Called when the CPU reads S7 with `R15 = 7`. If a VRAM → CPU
+    /// transfer (LMCM) is active, this returns the next pixel and
+    /// advances the source pointer. Otherwise S7 returns whatever was
+    /// last latched (e.g. by POINT).
+    fn pump_cpu_xfer_read(&mut self) -> u8 {
+        if self.cpu_xfer != CpuXfer::Lmcm {
+            return self.status[7];
+        }
+        let mut ctx = CmdCtx {
+            regs: &mut self.regs,
+            vram: &mut self.vram[..],
+            status: &mut self.status,
+            cpu_xfer: &mut self.cpu_xfer,
+            cpu_xfer_x: &mut self.cpu_xfer_x,
+            cpu_xfer_y: &mut self.cpu_xfer_y,
+        };
+        ctx.pump_read()
     }
 }
 
@@ -1407,8 +1732,18 @@ mod tests {
     /// inside a closure, then assert against `regs`, `vram`, `status`.
     fn with_g4(setup: impl FnOnce(&mut CmdCtx)) -> ([u8; 64], Vec<u8>, [u8; 10]) {
         let (mut regs, mut vram, mut status) = ctx_g4_inputs();
+        let mut cpu_xfer = CpuXfer::None;
+        let mut cpu_xfer_x = 0u32;
+        let mut cpu_xfer_y = 0u32;
         {
-            let mut ctx = CmdCtx { regs: &mut regs, vram: &mut vram, status: &mut status };
+            let mut ctx = CmdCtx {
+                regs: &mut regs,
+                vram: &mut vram,
+                status: &mut status,
+                cpu_xfer: &mut cpu_xfer,
+                cpu_xfer_x: &mut cpu_xfer_x,
+                cpu_xfer_y: &mut cpu_xfer_y,
+            };
             setup(&mut ctx);
         }
         (regs, vram, status)
@@ -1417,7 +1752,17 @@ mod tests {
     #[test]
     fn pixel_layout_classifies_screen5() {
         let (regs, mut vram, mut status) = ctx_g4_inputs();
-        let ctx = CmdCtx { regs: &mut regs.clone(), vram: &mut vram, status: &mut status };
+        let mut cpu_xfer = CpuXfer::None;
+        let mut cpu_xfer_x = 0u32;
+        let mut cpu_xfer_y = 0u32;
+        let ctx = CmdCtx {
+            regs: &mut regs.clone(),
+            vram: &mut vram,
+            status: &mut status,
+            cpu_xfer: &mut cpu_xfer,
+            cpu_xfer_x: &mut cpu_xfer_x,
+            cpu_xfer_y: &mut cpu_xfer_y,
+        };
         let layout = ctx.pixel_layout().expect("G4 must classify");
         assert_eq!(layout.bpp, 4);
         assert_eq!(layout.pitch, 128);
@@ -1457,7 +1802,17 @@ mod tests {
         let mut regs2 = [0u8; 64]; regs2[0] = 0x06; // G4 mode bits
         let mut status2 = [0u8; 10];
         let mut v2 = vram.clone();
-        let ctx = CmdCtx { regs: &mut regs2, vram: &mut v2, status: &mut status2 };
+        let mut cpu_xfer = CpuXfer::None;
+        let mut cpu_xfer_x = 0u32;
+        let mut cpu_xfer_y = 0u32;
+        let ctx = CmdCtx {
+            regs: &mut regs2,
+            vram: &mut v2,
+            status: &mut status2,
+            cpu_xfer: &mut cpu_xfer,
+            cpu_xfer_x: &mut cpu_xfer_x,
+            cpu_xfer_y: &mut cpu_xfer_y,
+        };
         let layout = ctx.pixel_layout().unwrap();
         assert_eq!(ctx.read_pixel(&layout, 0, 0), 0);
         assert_eq!(ctx.read_pixel(&layout, 1, 0), 5);
@@ -1646,14 +2001,66 @@ mod tests {
     }
 
     #[test]
-    fn cpu_transfer_commands_are_stubbed_safely() {
-        // LMMC, LMCM, HMMC should not panic; they just log and finish.
+    fn lmmc_starts_transfer_and_sets_tr_ce() {
+        // LMMC sets up a CPU → VRAM transfer and waits for R44 writes.
+        // CE + TR should be set after the command; the transfer is
+        // pumped externally by `Vdp::pump_cpu_xfer_write` which we
+        // don't exercise in the borrowed-state harness.
         let (_regs, _vram, status) = with_g4(|ctx| {
-            for cmd in [0xA0u8, 0xB0, 0xF0] {
-                ctx.regs[46] = cmd;
-                ctx.execute();
-            }
+            ctx.regs[40] = 4; ctx.regs[41] = 0;  // NX = 4 pixels
+            ctx.regs[42] = 1; ctx.regs[43] = 0;  // NY = 1 row
+            ctx.regs[46] = 0xB0;                  // LMMC, IMP
+            ctx.execute();
         });
-        assert_eq!(status[2] & 0x01, 0, "CE must be clear after stubs");
+        // Both TR (S2 bit 7) and CE (S2 bit 0) must be set so the CPU
+        // knows it can start streaming R44 writes.
+        assert_ne!(status[2] & 0x80, 0, "TR must be set");
+        assert_ne!(status[2] & 0x01, 0, "CE must be set");
+    }
+
+    #[test]
+    fn hmmc_starts_transfer_and_sets_tr_ce() {
+        let (_regs, _vram, status) = with_g4(|ctx| {
+            ctx.regs[40] = 8; ctx.regs[41] = 0;
+            ctx.regs[42] = 1; ctx.regs[43] = 0;
+            ctx.regs[46] = 0xF0;                  // HMMC
+            ctx.execute();
+        });
+        assert_ne!(status[2] & 0x80, 0, "TR must be set");
+        assert_ne!(status[2] & 0x01, 0, "CE must be set");
+    }
+
+    #[test]
+    fn lmcm_starts_transfer_and_preloads_s7() {
+        let (_regs, vram, status) = with_g4(|ctx| {
+            // Seed a pixel for LMCM to pick up.
+            let layout = ctx.pixel_layout().unwrap();
+            ctx.write_pixel(&layout, 0, 0, 0xD);
+            ctx.regs[40] = 4; ctx.regs[41] = 0;
+            ctx.regs[42] = 1; ctx.regs[43] = 0;
+            ctx.regs[46] = 0xA0;                  // LMCM
+            ctx.execute();
+        });
+        // S7 should already have the first pixel ready.
+        assert_eq!(status[7], 0xD, "first LMCM pixel should be preloaded into S7");
+        assert_ne!(status[2] & 0x80, 0, "TR must be set");
+        assert_ne!(status[2] & 0x01, 0, "CE must be set");
+        // VRAM is the same (LMCM doesn't modify VRAM, only reads from it).
+        let _ = vram;
+    }
+
+    #[test]
+    fn stop_aborts_active_cpu_transfer() {
+        let (_regs, _vram, status) = with_g4(|ctx| {
+            ctx.regs[40] = 4; ctx.regs[41] = 0;
+            ctx.regs[42] = 1; ctx.regs[43] = 0;
+            ctx.regs[46] = 0xB0;                  // LMMC
+            ctx.execute();
+            // ... CPU never writes R44, then game issues STOP.
+            ctx.regs[46] = 0x00;                  // STOP
+            ctx.execute();
+        });
+        // STOP clears both TR and CE.
+        assert_eq!(status[2] & 0x81, 0, "STOP must clear TR + CE");
     }
 }

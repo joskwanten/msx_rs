@@ -46,6 +46,14 @@ struct Uniforms {
     // 256 entries × 4 bytes, organised as 64 vec4<u32> (4 scanlines per
     // vec4, low-to-high lane order).
     scanline_regs: array<vec4<u32>, 64>,
+    // Second per-scanline array — R2 (display page selector) lives in
+    // byte 0; other lanes reserved for future per-scanline regs.
+    scanline_regs2: array<vec4<u32>, 64>,
+    // Third per-scanline array — colour/pattern table bases:
+    //   bits 0..7   = R3  (colour table base, low byte)
+    //   bits 8..15  = R4  (pattern generator table base)
+    //   bits 16..23 = R10 (colour table extension, G3+)
+    scanline_regs3: array<vec4<u32>, 64>,
     palette: array<vec4<f32>, 16>,  // TMS9918 fixed palette (index 0 = transparent)
 }
 
@@ -93,6 +101,35 @@ fn line_r5(line: u32)  -> u32 { return  scanline_packed(line)        & 0xFFu; }
 fn line_r6(line: u32)  -> u32 { return (scanline_packed(line) >>  8u) & 0xFFu; }
 fn line_r11(line: u32) -> u32 { return (scanline_packed(line) >> 16u) & 0xFFu; }
 fn line_r23(line: u32) -> u32 { return (scanline_packed(line) >> 24u) & 0xFFu; }
+
+// Second per-scanline pack — currently only R2 in byte 0.
+fn scanline_packed2(line: u32) -> u32 {
+    let v = u.scanline_regs2[line >> 2u];
+    switch line & 3u {
+        case 0u:  { return v.x; }
+        case 1u:  { return v.y; }
+        case 2u:  { return v.z; }
+        default:  { return v.w; }
+    }
+}
+fn line_r2(line: u32) -> u32 { return  scanline_packed2(line)        & 0xFFu; }
+fn line_r0(line: u32) -> u32 { return (scanline_packed2(line) >>  8u) & 0xFFu; }
+fn line_r1(line: u32) -> u32 { return (scanline_packed2(line) >> 16u) & 0xFFu; }
+fn line_r7(line: u32) -> u32 { return (scanline_packed2(line) >> 24u) & 0xFFu; }
+
+// Third per-scanline pack — table base registers.
+fn scanline_packed3(line: u32) -> u32 {
+    let v = u.scanline_regs3[line >> 2u];
+    switch line & 3u {
+        case 0u:  { return v.x; }
+        case 1u:  { return v.y; }
+        case 2u:  { return v.z; }
+        default:  { return v.w; }
+    }
+}
+fn line_r3(line: u32)  -> u32 { return  scanline_packed3(line)        & 0xFFu; }
+fn line_r4(line: u32)  -> u32 { return (scanline_packed3(line) >>  8u) & 0xFFu; }
+fn line_r10(line: u32) -> u32 { return (scanline_packed3(line) >> 16u) & 0xFFu; }
 
 // In Graphic 1/2, fg/bg = 0 means transparent — fall through to backdrop.
 fn apply_transparency(color: u32) -> u32 {
@@ -205,9 +242,12 @@ fn sample_sprite(px: u32, py: u32) -> u32 {
 // consecutive tile indices. That's why MSX1 BASIC text on Screen 1 has only
 // 32 / 8 = 32 color choices across the alphabet.
 fn shade_graphic1(px: u32, py: u32) -> u32 {
-    let nt_base = (reg(2u) & 0x0Fu) << 10u;
-    let pt_base = (reg(4u) & 0x07u) << 11u;
-    let ct_base = reg(3u) << 6u;
+    // Per-line lookups so a G1 status bar below a G4 playfield (KV2,
+    // Vampire Killer, etc.) reads its name/pattern/colour tables from
+    // wherever the game pointed them for this scanline band.
+    let nt_base = (line_r2(py) & 0x0Fu) << 10u;
+    let pt_base = (line_r4(py) & 0x07u) << 11u;
+    let ct_base = line_r3(py) << 6u;
 
     let tile_x = px >> 3u;
     let tile_y = py >> 3u;
@@ -232,9 +272,9 @@ fn shade_graphic1(px: u32, py: u32) -> u32 {
 // 256-entry "banks", one per vertical third of the screen. Each color byte
 // covers one *row* of one tile — so per-pixel-row coloring is possible.
 fn shade_graphic2(px: u32, py: u32) -> u32 {
-    let nt_base = (reg(2u) & 0x0Fu) << 10u;
-    let pt_base = (reg(4u) & 0x04u) << 11u;
-    let ct_base = (reg(3u) & 0x80u) << 6u;
+    let nt_base = (line_r2(py) & 0x0Fu) << 10u;
+    let pt_base = (line_r4(py) & 0x04u) << 11u;
+    let ct_base = (line_r3(py) & 0x80u) << 6u;
 
     let tile_x = px >> 3u;
     let tile_y = py >> 3u;
@@ -273,8 +313,8 @@ fn shade_graphic0(px: u32, py: u32) -> u32 {
         return bg;
     }
 
-    let nt_base = (reg(2u) & 0x0Fu) << 10u;
-    let pt_base = (reg(4u) & 0x07u) << 11u;
+    let nt_base = (line_r2(py) & 0x0Fu) << 10u;
+    let pt_base = (line_r4(py) & 0x07u) << 11u;
 
     let text_x = px - 8u;
     let char_x = text_x / 6u;
@@ -334,9 +374,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         return u.palette[backdrop()];
     }
 
-    // Active 256×192 area sits at offset (32, 24) within the 320×240 canvas.
+    // Visible-area height depends on R9 bit 7 (LN): clear = 192 lines
+    // (TMS9918-compatible, top-aligned at y=24), set = 212 lines
+    // (V9938 MSX2 mode used by games with a status bar — KV2, Vampire
+    // Killer, Metal Gear, etc.). Both modes keep canvas_y=24 as the top
+    // of the active area; 212-mode extends 20 rows further down so the
+    // score / UI band below the playfield is no longer clipped.
+    let lines_212 = (reg(9u) & 0x80u) != 0u;
+    let active_bottom: u32 = select(216u, 236u, lines_212);
     let in_active = canvas_x >= 32u && canvas_x < 288u
-                 && canvas_y >= 24u && canvas_y < 216u;
+                 && canvas_y >= 24u && canvas_y < active_bottom;
     if (!in_active) {
         return u.palette[backdrop()];
     }
@@ -345,13 +392,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let py = canvas_y - 24u;
 
     // Mode dispatch — see header comment for the M1/M2/M3 truth table.
-    // M3 = R0 bit 1, M2 = R1 bit 3 (per TMS9918 datasheet).
-    // V9938 adds M4 = R0 bit 2 and M5 = R0 bit 3.
-    let m1 = (reg(1u) >> 4u) & 1u;
-    let m2 = (reg(1u) >> 3u) & 1u;
-    let m3 = (reg(0u) >> 1u) & 1u;
-    let m4 = (reg(0u) >> 2u) & 1u;
-    let m5 = (reg(0u) >> 3u) & 1u;
+    // V9938 software (KV2, Vampire Killer, Quarth, ...) switches mode
+    // mid-frame via line-interrupt handlers: a G4 bitmap playfield with
+    // a G1 text status bar at the bottom, for example. The per-line R0
+    // and R1 snapshot lets the shader run a DIFFERENT shading path on
+    // each scanline.
+    let r0_line = line_r0(py);
+    let r1_line = line_r1(py);
+    let m1 = (r1_line >> 4u) & 1u;
+    let m2 = (r1_line >> 3u) & 1u;
+    let m3 = (r0_line >> 1u) & 1u;
+    let m4 = (r0_line >> 2u) & 1u;
+    let m5 = (r0_line >> 3u) & 1u;
 
     var color_idx: u32;
     // V9938 modes (M4 or M5 set) are checked first. Only G4 (Screen 5,
@@ -398,21 +450,31 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 //     Color table:     32 × 16 bytes — one byte per scan-line of the
 //                      sprite (only first 8 used for 8×8 sprites)
 //
-//   * Color byte layout:
-//        bit 7 = IC (skip collision)
-//        bit 6 = CC (this line OR-mixes onto already-drawn sprites)
-//        bit 5 = 0
-//        bit 4 = EC (early clock — shift X by -32)
+//   * Colour byte layout (verified against openMSX SpriteChecker.cc and
+//     WebMSX VDP.js; previous version had EC at the wrong bit position
+//     and CC semantics inverted, which is why multi-colour sprites
+//     flickered and CC overlays sometimes rendered solo):
+//        bit 7 = EC (early clock — shift X by -32)
+//        bit 6 = CC (this sprite ONLY contributes if a lower-index
+//                     CC=0 sprite has already hit this pixel; OR-mixes
+//                     its colour onto that base)
+//        bit 5 = IC (individual collision disable — collision detection
+//                     skipped for this sprite line; we don't model
+//                     collisions yet, so this bit is currently ignored)
+//        bit 4 = 0  (reserved)
 //        bits 3-0 = colour (4-bit palette index, 0 = transparent)
 //
-//   * OR-mixing: when CC=1, the colour bits OR onto whatever colour was
-//     already produced for this fragment by a lower-numbered sprite.
-//     Used for multi-coloured sprites (stack several with different
-//     colour bits and CC set on the upper ones).
+//   * CC semantics: a sprite with CC=1 is INVISIBLE unless there's a
+//     prior hit at the same pixel from a sprite with CC=0 (lower index).
+//     The CC=1 sprite's colour then ORs onto the base. Multi-colour
+//     character sprites work by drawing a "base" sprite (CC=0) covering
+//     the full silhouette, then adding CC=1 "highlight" sprites on top
+//     for inner detail.
 //
-// We don't enforce per-frame sprite-count limits (no IRQ-on-overflow),
-// but we do cap at 8 visible sprites per line per the spec — going past
-// 8 silently drops further sprites.
+// 8-per-line cap: per real V9938, at most 8 sprites whose Y range covers
+// the current scanline get processed — regardless of whether they
+// actually have an opaque pixel at the X being drawn. Excess sprites
+// are silently skipped (we don't yet update the 9S status flag).
 fn sample_sprite_mode2(px: u32, py: u32) -> u32 {
     // Per-scanline R5 / R6 / R11: V9938 software often points to a
     // different SAT for different bands of the screen via line interrupts.
@@ -420,6 +482,15 @@ fn sample_sprite_mode2(px: u32, py: u32) -> u32 {
     // we look up the one matching the current `py` here.
     let r5 = line_r5(py);
     let r11 = line_r11(py);
+    // V9938 spec §2.4 SAT base address layout:
+    //   R#5  : |A14|A13|A12|A11|A10|A9 | A8| A7|
+    //   R#11 : | 0 | 0 | 0 | 0 | 0 | 0 |A16|A15|
+    // NB: The figure on page 93 annotates R5[1:0] as "always set to 1",
+    // but the worked G4 example on page 40 puts SAT at 0x7A00 which is
+    // only reachable WITHOUT that forcing. The example reflects how the
+    // chip actually behaves; the figure annotation is misleading (we
+    // tested forcing and it makes mode-2 sprites disappear entirely
+    // because games write R5 expecting the raw value to be honoured).
     let attr_base = ((r5 & 0xFCu) << 7u) | ((r11 & 0x03u) << 15u);
     let color_base = attr_base - 0x200u;
     let sg_base = (line_r6(py) & 0x3Fu) << 11u;
@@ -434,6 +505,13 @@ fn sample_sprite_mode2(px: u32, py: u32) -> u32 {
 
     var hit_color: u32 = 0xFFu;
     var sprites_drawn: u32 = 0u;
+    // Per V9938 spec §2.7: "the portions where CC is set to 1 (for each
+    // line) will be displayed only on horizontal lines where sprites
+    // with a lower number exist." This gate is per-SCANLINE — Y-overlap
+    // of any lower-# sprite is enough; the lower-# sprite does NOT need
+    // to be opaque at the same X. We track that state with a single bool
+    // flipped after the FIRST Y-overlapping sprite is processed.
+    var prior_on_line: bool = false;
 
     for (var s: u32 = 0u; s < 32u; s = s + 1u) {
         let attr_addr = attr_base + s * 4u;
@@ -449,7 +527,23 @@ fn sample_sprite_mode2(px: u32, py: u32) -> u32 {
         }
 
         let dy_screen = i32(py) - sy;
+        // Y-miss: don't count toward 8-per-line limit, don't flip
+        // prior_on_line — the sprite isn't on this scanline at all.
         if (dy_screen < 0 || dy_screen >= i32(box_size)) { continue; }
+
+        // Per V9938 spec §2.1: "up to 8 sprites with the highest priority
+        // are displayed" per horizontal line. The limit counts every sprite
+        // whose Y-range overlaps the scanline, INCLUDING transparent ones
+        // and ones whose X is off-screen. So we increment as soon as the
+        // Y-overlap is confirmed — before reading colour/pattern.
+        sprites_drawn = sprites_drawn + 1u;
+        if (sprites_drawn > 8u) { break; }
+
+        // Capture whether a lower-# sprite was on this scanline BEFORE
+        // we flip the flag for this sprite. A CC=1 sprite's gate looks
+        // at the state from previous iterations, not its own existence.
+        let had_prior = prior_on_line;
+        prior_on_line = true;
 
         // Demagnified line within the sprite.
         var ly: u32 = u32(dy_screen);
@@ -459,9 +553,19 @@ fn sample_sprite_mode2(px: u32, py: u32) -> u32 {
         let color_byte = vram_byte(color_base + s * 16u + ly);
         let color = color_byte & 0x0Fu;
         // Skip transparent colour first — saves an X/pattern lookup.
+        // (This sprite has already been counted toward the 8-per-line
+        // limit above; transparency doesn't undo that.)
         if (color == 0u) { continue; }
 
-        let ec = (color_byte & 0x20u) != 0u;
+        // Per V9938 spec §2.6 (Sprite Color Table):
+        //   bit 7 = EC  (Early Clock — display shifted 32 dots left when 1)
+        //   bit 6 = CC  (Color Combination — priority cancelled + OR-mix; see §2.7)
+        //   bit 5 = IC  (Individual Collision detect disabled when 1; we don't
+        //                model sprite-sprite collision in S0 yet, so this bit
+        //                is currently ignored but must NOT be misread as EC)
+        //   bit 4 = 0   (reserved)
+        //   bits 3..0 = colour code (0 = transparent)
+        let ec = (color_byte & 0x80u) != 0u;
         let cc = (color_byte & 0x40u) != 0u;
 
         let x_raw = vram_byte(attr_addr + 1u);
@@ -490,18 +594,29 @@ fn sample_sprite_mode2(px: u32, py: u32) -> u32 {
         let bit = 7u - (lx & 7u);
         if (((pat_byte >> bit) & 1u) == 0u) { continue; }
 
-        // We've got a pixel hit. Track 8-per-line limit before mixing.
-        sprites_drawn = sprites_drawn + 1u;
-        if (sprites_drawn > 8u) { break; }
-
-        if (hit_color == 0xFFu) {
-            hit_color = color;
-        } else if (cc) {
-            // Later sprite ORs onto whatever's there — gives multi-colour
-            // sprites by stacking several with different bits set.
-            hit_color = hit_color | color;
+        // Pixel hit (sprite is opaque at this X). The 8-per-line limit
+        // was checked at the Y-overlap step above; here we only decide
+        // colour-mix per V9938 spec §2.7.
+        if (cc) {
+            // CC=1 sprite: only contributes when a lower-# sprite is also
+            // on this scanline (had_prior). Then OR-mixes its colour onto
+            // any existing contribution; if hit_color is still transparent
+            // it just adopts this sprite's colour.
+            if (had_prior) {
+                if (hit_color == 0xFFu) {
+                    hit_color = color;
+                } else {
+                    hit_color = hit_color | color;
+                }
+            }
+            // No lower-# sprite on this scanline → CC=1 sprite is invisible.
+        } else {
+            // CC=0 sprite: standard priority — lowest sprite index wins.
+            if (hit_color == 0xFFu) {
+                hit_color = color;
+            }
+            // Otherwise a higher-priority (lower-#) sprite already won.
         }
-        // Otherwise keep the higher-priority (lower sprite index) colour.
     }
 
     return hit_color;
@@ -525,9 +640,9 @@ fn sample_sprite_mode2(px: u32, py: u32) -> u32 {
 // Sprites in G3 use V9938 mode 2 (8 per line, per-line colour, OR-mix). Not
 // implemented yet — this function just returns the bitmap.
 fn shade_g3(px: u32, py: u32) -> u32 {
-    let nt_base = (reg(2u) & 0x7Fu) << 10u;
-    let pt_base = (reg(4u) & 0x3Cu) << 11u;
-    let ct_base = ((reg(3u) & 0xFFu) << 6u) | ((reg(10u) & 0x07u) << 14u);
+    let nt_base = (line_r2(py) & 0x7Fu) << 10u;
+    let pt_base = (line_r4(py) & 0x3Cu) << 11u;
+    let ct_base = ((line_r3(py) & 0xFFu) << 6u) | ((line_r10(py) & 0x07u) << 14u);
 
     let tile_x = px >> 3u;
     let tile_y = py >> 3u;
@@ -562,11 +677,14 @@ fn shade_g3(px: u32, py: u32) -> u32 {
 //
 // Pixel value is a 4-bit palette index → u.palette[idx].
 fn shade_g4(px: u32, py: u32) -> u32 {
-    let page_base = ((reg(2u) >> 5u) & 3u) << 15u;
-    // R23 is the vertical-scroll register and changes per-scanline on
-    // most MSX2 software (line-interrupt-driven split-screen scrolls).
-    // Use the snapshot for THIS scanline. Bitmap rows wrap mod 256
-    // because a G4 page is 256 rows (32 KiB / 128 bytes-per-row).
+    // Per-scanline R2: Quarth (and other MSX2 software) flips the display
+    // page mid-frame via line-interrupt-driven R2 writes — top band on
+    // page 0, bottom on page 1, etc. Without the per-line lookup we'd
+    // render every line from the LAST-written R2, missing whichever
+    // band's page was active earlier.
+    let page_base = ((line_r2(py) >> 5u) & 3u) << 15u;
+    // R23 likewise changes per-scanline for split-screen scrolls. Wrap
+    // mod 256 because a G4 page is 256 rows (32 KiB / 128 bytes/row).
     // Sprites are unaffected — they're positioned by their own Y in
     // the SAT, independent of R23.
     let bitmap_y = (py + line_r23(py)) & 0xFFu;

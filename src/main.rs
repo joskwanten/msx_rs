@@ -35,17 +35,22 @@ use z80emu::{host::TsCounter, Cpu, Z80NMOS};
 /// VBLANK and let the game's interrupt handler run.
 const FRAME_TSTATES: i32 = 59_659;
 
-/// Visible scan-lines per frame — the area the VDP actually renders. We
-/// step the CPU once per visible line so V9938 line interrupts and
-/// per-line register tricks (split-screen scroll, per-band SAT) can
-/// land in the right scanline. Bottom-border + VBlank lines are batched
-/// after the visible loop.
-const VISIBLE_LINES: u32 = 192;
+/// Visible scan-lines per frame, sized for V9938's 212-line mode (R9
+/// bit 7 = LN). MSX1 software (and MSX2 in 192-line mode) only uses the
+/// top 192 of these — but most MSX2 cartridges with a status bar (KV2,
+/// Vampire Killer, Metal Gear, etc.) enable 212 lines so the score area
+/// fits below the playfield. Snapshotting / line-IRQ checks loop over
+/// all 212 so the per-line shader state is in place when 212-mode kicks
+/// in; 192-mode software just has the extra 20 entries idle.
+const VISIBLE_LINES: u32 = 212;
 
-/// T-states budget per scanline. Frame budget divided by total NTSC line
-/// count (262) — close enough to real hardware (~228 T-states / line) that
-/// IRQ-driven games behave correctly.
-const SCANLINE_TSTATES: i32 = FRAME_TSTATES / 262;
+/// T-states budget per scanline. Real NTSC V9938 uses 228 T-states per line
+/// (3.579545 MHz / 59.94 Hz / 262 lines = 228.02). Hardcoding 228 — instead
+/// of `FRAME_TSTATES / 262` which integer-truncates to 227 — keeps the
+/// scanline boundaries aligned with where real hardware fires line IRQs,
+/// which matters for beam-racing software (Quarth's split-screen scroll,
+/// per-line palette tricks, etc.).
+const SCANLINE_TSTATES: i32 = 228;
 
 /// MSX target frame rate. We pace CPU emulation against wall-clock time so
 /// the emulator runs at the right speed regardless of host display refresh
@@ -422,27 +427,65 @@ impl State {
     ///     required outside of the visible area).
     fn step_frame(&mut self) {
         self.clock.0 = Wrapping(0);
+        // Clear S2 bit 6 (VR) at the start of a new frame — software that
+        // polls VR to detect the VBlank edge needs to see it fall here so
+        // the next VBlank's rising edge is observable.
+        self.bus.vdp.clear_vblank_flag();
 
-        // Visible scan-out, per line. `execute_with_limit` takes an
-        // ABSOLUTE clock target, not a delta — so the cumulative limit
-        // for line N is `SCANLINE_TSTATES * (N + 1)`. Passing the bare
-        // SCANLINE_TSTATES on every iteration would let only the FIRST
-        // call do any work; every subsequent call would see clock already
-        // past the limit and return immediately, starving the CPU.
-        for line in 0..VISIBLE_LINES {
-            self.bus.vdp.snapshot_scanline(line as usize);
-            if self.bus.vdp.line_irq_target(line as u8) && self.bus.vdp.regs[0] & 0x10 != 0 {
-                self.bus.vdp.fire_line_irq();
+        // Cycle-accurate(-ish) line interrupts: we step the CPU one
+        // instruction at a time and re-check the current scanline
+        // BETWEEN instructions. Line IRQs and snapshots fire at the
+        // exact instruction boundary nearest the target T-state — at
+        // most ~25 T-states late (the longest Z80 instruction), versus
+        // the ~200-state slop the previous per-scanline-batched approach
+        // produced. Per-instruction `execute_next` is a few % slower than
+        // `execute_with_limit` but still well under the frame budget.
+        let visible_end_clock: i32 = SCANLINE_TSTATES * VISIBLE_LINES as i32;
+        let mut last_line: i32 = -1;
+        let mut vblank_fired = false;
+
+        while self.clock.0.0 < FRAME_TSTATES {
+            let current_line = self.clock.0.0 / SCANLINE_TSTATES;
+
+            // Walk last_line up to current_line (capped at the last
+            // visible line), snapshotting and firing line interrupts at
+            // each boundary we cross. The `while` covers the case where
+            // a single long instruction crosses a scanline boundary —
+            // we still process the snapshot/IRQ for the new line.
+            let target = current_line.min(VISIBLE_LINES as i32 - 1);
+            while last_line < target {
+                last_line += 1;
+                self.bus.vdp.snapshot_scanline(last_line as usize);
+                if self.bus.vdp.line_irq_target(last_line as u8)
+                    && self.bus.vdp.regs[0] & 0x10 != 0
+                {
+                    self.bus.vdp.fire_line_irq();
+                }
             }
-            let limit = SCANLINE_TSTATES * (line as i32 + 1);
-            let _ = self.cpu.execute_with_limit(&mut self.bus, &mut self.clock, limit);
+
+            // VBlank fires once, at the first instruction boundary after
+            // the end of the visible scan-out. The frame IRQ enables
+            // bit 5 of R1; the handler runs naturally in the remaining
+            // CPU time.
+            if !vblank_fired && self.clock.0.0 >= visible_end_clock {
+                self.bus.vdp.start_vblank();
+                vblank_fired = true;
+            }
+
+            let _ = self.cpu.execute_next(
+                &mut self.bus,
+                &mut self.clock,
+                Option::<fn(z80emu::CpuDebug)>::None,
+            );
         }
 
-        // Bottom border + VBlank. Frame interrupt fires here on real
-        // hardware; we trigger and run the CPU through the rest of the
-        // frame budget without line stepping.
-        self.bus.vdp.start_vblank();
-        let _ = self.cpu.execute_with_limit(&mut self.bus, &mut self.clock, FRAME_TSTATES);
+        // Defensive: if the frame budget was so short we never reached
+        // visible_end_clock (won't happen with our FRAME_TSTATES, but
+        // belt-and-suspenders), still raise VBlank so the game's
+        // interrupt handler runs at least once per call.
+        if !vblank_fired {
+            self.bus.vdp.start_vblank();
+        }
     }
 
     /// Pace MSX emulation against wall-clock time. Uses a fractional-frame

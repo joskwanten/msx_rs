@@ -18,8 +18,8 @@
 use crate::ppi::Ppi;
 use crate::scc::Scc;
 use crate::slot::{
-    detect_mapper, CartridgeMapper, KonamiMegaRomCartridge, KonamiMegaRomSccCartridge, RamSlot, RomSlot, Slot,
-    Slots, SubslottedSlot,
+    detect_mapper, CartridgeMapper, KonamiMegaRomCartridge, KonamiMegaRomSccCartridge,
+    MappedRamSlot, RomSlot, Slot, Slots, SubslottedSlot,
 };
 use crate::vdp::Vdp;
 use psg::PSG;
@@ -121,9 +121,11 @@ impl Bus {
         //                   slot calls (CALSLT) when it needs the V9938-specific
         //                   routines.
         //              3-2: empty
-        //              3-3: 64 KiB RAM — the mapper for >64 KiB extended RAM
-        //                   lands in a follow-up sub-phase, MSX2 BIOS boots
-        //                   with this flat RAM regardless.
+        //              3-3: V9938 RAM mapper — 256 KiB pool addressed through
+        //                   four 16 KiB banks (ports 0xFC-0xFF). MSX2 BIOS
+        //                   uses 64 KiB linear at boot via the mapper's
+        //                   default 3/2/1/0 setup; games that need more
+        //                   reprogramme the banks.
         let bios = RomSlot::new(Box::from(CBIOS_MAIN), 0x0000);
         let basic = RomSlot::new(Box::from(CBIOS_BASIC), 0x4000);
         let sub_rom = RomSlot::new(Box::from(CBIOS_SUB), 0x0000);
@@ -132,7 +134,7 @@ impl Bus {
             Slot::Empty,                   // 3-0
             Slot::Rom(sub_rom),            // 3-1 ← C-BIOS Sub-ROM
             Slot::Empty,                   // 3-2
-            Slot::Ram(RamSlot::new()),     // 3-3 ← RAM
+            Slot::MappedRam(MappedRamSlot::new()),  // 3-3 ← V9938 RAM mapper (256 KiB)
         ]);
 
         let cartridge_slot = build_cartridge_slot(cartridge_rom, scc);
@@ -194,6 +196,14 @@ impl Io for Bus {
             0xA2 => 0xFF, // PSG port-B read (not wired up yet)
             0xA8 => self.slots.slot_register,
             0xA9 => self.ppi.read_row(), // keyboard row state
+            // V9938 RAM mapper: bank-select register read-back. Returns
+            // the bank index ORed with 0xF0 so software detects this is
+            // a 16-bank (= 256 KiB) mapper.
+            0xFC..=0xFF => self
+                .slots
+                .mapper()
+                .map(|m| m.get_bank((port - 0xFC) as usize))
+                .unwrap_or(0xFF),
             _ => 0xFF,
         }
     }
@@ -224,6 +234,14 @@ impl Io for Bus {
             // (port A out, B in, C lo out / hi out). We don't model the
             // 8255 modes, so the value is irrelevant.
             0xAB => {}
+            // V9938 RAM mapper bank selectors — one per CPU page. Writing
+            // a value selects which 16 KiB bank appears in that page;
+            // page 0 = port 0xFC, page 1 = 0xFD, etc.
+            0xFC..=0xFF => {
+                if let Some(m) = self.slots.mapper_mut() {
+                    m.set_bank((port - 0xFC) as usize, value);
+                }
+            }
             _ => {} // unmapped writes silently dropped
         }
     }

@@ -32,6 +32,12 @@ pub enum Slot {
     Rom(RomSlot),
     /// 64 KiB of RAM, addressable across all pages.
     Ram(RamSlot),
+    /// V9938 RAM mapper: 256 KiB pool, four bank-select registers (one per
+    /// CPU page) driven by I/O ports 0xFC-0xFF. Lets MSX2 software see
+    /// more than 64 KiB of RAM by paging 16 KiB banks into each address-
+    /// space quarter. Required by heavier MSX2 titles (Aleste, SD
+    /// Snatcher, etc.).
+    MappedRam(MappedRamSlot),
     /// An expanded slot: 4 subslots selected via the FFFFh protocol.
     /// Boxed because the variant transitively contains `[Slot; 4]` — otherwise
     /// the enum would have infinite size.
@@ -48,6 +54,7 @@ impl Memory for Slot {
             Slot::Empty => 0xFF,
             Slot::Rom(r) => r.read8(addr),
             Slot::Ram(r) => r.read8(addr),
+            Slot::MappedRam(r) => r.read8(addr),
             Slot::Subslotted(s) => s.read8(addr),
             Slot::KonamiMegaRomSccCartridge(c) => c.read8(addr),
             Slot::KonamiMegaRomCartridge(c) => c.read8(addr),
@@ -59,6 +66,7 @@ impl Memory for Slot {
             Slot::Empty => {}
             Slot::Rom(_) => {} // ROM: writes ignored
             Slot::Ram(r) => r.write8(addr, value),
+            Slot::MappedRam(r) => r.write8(addr, value),
             Slot::Subslotted(s) => s.write8(addr, value),
             Slot::KonamiMegaRomSccCartridge(c) => c.write8(addr, value),
             Slot::KonamiMegaRomCartridge(c) => c.write8(addr, value),
@@ -122,6 +130,90 @@ impl Memory for RamSlot {
     }
 }
 
+/// V9938 memory mapper: 256 KiB of RAM addressed through four 16 KiB
+/// banks (one per CPU address-space page). Software selects which bank
+/// occupies each page by writing the bank index to I/O ports 0xFC..0xFF:
+///
+///   port 0xFC ← bank for page 0 (0x0000-0x3FFF)
+///   port 0xFD ← bank for page 1 (0x4000-0x7FFF)
+///   port 0xFE ← bank for page 2 (0x8000-0xBFFF)
+///   port 0xFF ← bank for page 3 (0xC000-0xFFFF)
+///
+/// Reading those ports returns the last-written bank index ORed with
+/// `0xF0` — the high nibble being "open bus / not implemented" tells
+/// software that this is a 16-bank (= 256 KiB) mapper, the standard
+/// for mid-range MSX2 machines.
+///
+/// Real hardware MSX2 RAM mappers come in 64/128/256/512/1024 KiB
+/// flavours; 256 KiB is the sweet spot for Konami-era cartridges and
+/// keeps the on-disk size of the emulator reasonable.
+const MAPPER_BANKS: usize = 16;
+const MAPPER_RAM_SIZE: usize = MAPPER_BANKS * 0x4000;
+
+pub struct MappedRamSlot {
+    ram: Box<[u8; MAPPER_RAM_SIZE]>,
+    /// Bank-select register per CPU page. Low 4 bits select the 16 KiB
+    /// bank (0..15); the upper 4 bits are open bus (returned as 1s when
+    /// the CPU reads the port back).
+    banks: [u8; 4],
+}
+
+impl MappedRamSlot {
+    pub fn new() -> Self {
+        Self {
+            ram: Box::new([0u8; MAPPER_RAM_SIZE]),
+            // Default: linear identity mapping — page 0 → bank 3,
+            // page 1 → bank 2, page 2 → bank 1, page 3 → bank 0. This
+            // mirrors what the C-BIOS init sets up so software that
+            // probes the mapper before configuring it gets a sensible
+            // 64 KiB view of RAM.
+            banks: [3, 2, 1, 0],
+        }
+    }
+
+    /// Update the bank register for one CPU page (0..3). Low 4 bits go
+    /// to the bank index; the upper 4 are stored as-is but masked off
+    /// on reads — software relies on that mask for mapper-size probing.
+    pub fn set_bank(&mut self, page: usize, value: u8) {
+        if page < 4 {
+            self.banks[page] = value & 0x0F;
+        }
+    }
+
+    /// Read back a bank register. The high nibble is set to indicate
+    /// "this is a 16-bank mapper" — software writes 0xFF to a port and
+    /// reads back 0x0F to confirm only 4 bank-select bits are wired.
+    pub fn get_bank(&self, page: usize) -> u8 {
+        if page < 4 {
+            self.banks[page] | 0xF0
+        } else {
+            0xFF
+        }
+    }
+}
+
+impl Default for MappedRamSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Memory for MappedRamSlot {
+    fn read8(&self, addr: u16) -> u8 {
+        let page = (addr >> 14) as usize;
+        let bank = self.banks[page] as usize;
+        let offset = (bank << 14) | (addr as usize & 0x3FFF);
+        self.ram[offset]
+    }
+
+    fn write8(&mut self, addr: u16, value: u8) {
+        let page = (addr >> 14) as usize;
+        let bank = self.banks[page] as usize;
+        let offset = (bank << 14) | (addr as usize & 0x3FFF);
+        self.ram[offset] = value;
+    }
+}
+
 /// Primary slot map. Owns the slot register and the four slot contents.
 pub struct Slots {
     pub slot_register: u8,
@@ -142,6 +234,45 @@ impl Slots {
     /// swap will redo slot selection through the BIOS init.
     pub fn set_slot(&mut self, idx: usize, slot: Slot) {
         self.slots[idx] = slot;
+    }
+
+    /// Find the (first) RAM mapper in the slot tree. Used by the bus to
+    /// route I/O ports 0xFC-0xFF to the mapper's bank-select registers.
+    /// Walks subslots one level deep — sufficient for our layout, where
+    /// the mapper lives in subslot 3-3.
+    pub fn mapper_mut(&mut self) -> Option<&mut MappedRamSlot> {
+        for slot in self.slots.iter_mut() {
+            match slot {
+                Slot::MappedRam(m) => return Some(m),
+                Slot::Subslotted(s) => {
+                    for sub in s.subslots.iter_mut() {
+                        if let Slot::MappedRam(m) = sub {
+                            return Some(m);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Read-only variant of `mapper_mut` for I/O reads of 0xFC-0xFF.
+    pub fn mapper(&self) -> Option<&MappedRamSlot> {
+        for slot in self.slots.iter() {
+            match slot {
+                Slot::MappedRam(m) => return Some(m),
+                Slot::Subslotted(s) => {
+                    for sub in s.subslots.iter() {
+                        if let Slot::MappedRam(m) = sub {
+                            return Some(m);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Decode which slot is currently mapped to the page containing `addr`.
@@ -179,7 +310,7 @@ impl Memory for Slots {
 /// primary slot register does (two bits per 16 KiB page).
 pub struct SubslottedSlot {
     pub subslot_register: u8,
-    subslots: [Slot; 4],
+    pub subslots: [Slot; 4],
 }
 
 impl SubslottedSlot {
