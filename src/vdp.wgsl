@@ -36,6 +36,7 @@
 
 struct Uniforms {
     framebuffer_size: vec2<f32>,
+    // Alignment padding so `regs` starts on a 16-byte boundary.
     _pad: vec2<u32>,
     regs: array<vec4<u32>, 6>,      // R0-R23 (one byte per u32 lane)
     // Per-visible-scanline snapshots of R5 / R6 / R11 / R23, packed:
@@ -49,10 +50,11 @@ struct Uniforms {
     // Second per-scanline array — R2 (display page selector) lives in
     // byte 0; other lanes reserved for future per-scanline regs.
     scanline_regs2: array<vec4<u32>, 64>,
-    // Third per-scanline array — colour/pattern table bases:
+    // Third per-scanline array — colour/pattern table bases + R8:
     //   bits 0..7   = R3  (colour table base, low byte)
     //   bits 8..15  = R4  (pattern generator table base)
     //   bits 16..23 = R10 (colour table extension, G3+)
+    //   bits 24..31 = R8  (SPD sprite-disable + TP colour-0 transparency)
     scanline_regs3: array<vec4<u32>, 64>,
     palette: array<vec4<f32>, 16>,  // TMS9918 fixed palette (index 0 = transparent)
 }
@@ -130,6 +132,7 @@ fn scanline_packed3(line: u32) -> u32 {
 fn line_r3(line: u32)  -> u32 { return  scanline_packed3(line)        & 0xFFu; }
 fn line_r4(line: u32)  -> u32 { return (scanline_packed3(line) >>  8u) & 0xFFu; }
 fn line_r10(line: u32) -> u32 { return (scanline_packed3(line) >> 16u) & 0xFFu; }
+fn line_r8(line: u32)  -> u32 { return (scanline_packed3(line) >> 24u) & 0xFFu; }
 
 // In Graphic 1/2, fg/bg = 0 means transparent — fall through to backdrop.
 fn apply_transparency(color: u32) -> u32 {
@@ -160,7 +163,13 @@ fn apply_transparency(color: u32) -> u32 {
 fn sample_sprite(px: u32, py: u32) -> u32 {
     // R8 bit 1 (SPD) = sprite display disable. When set, sprites must
     // not render. Per V9938 spec §2.2 and fMSX MSX.h `SpritesOFF` macro.
-    if ((reg(8u) & 0x02u) != 0u) { return 0xFFu; }
+    // Use the PER-SCANLINE snapshot, not the end-of-frame register: SPD is
+    // sampled during active scan-out on real hardware. Games that software-
+    // multiplex sprites (Vampire Killer) set SPD=1 inside the VBlank ISR
+    // while they rewrite the SAT, then clear it before the next active scan.
+    // Sampling the end-of-frame value caught that transient SPD=1 and blanked
+    // every sprite on jittering frames → whole-screen sprite flicker.
+    if ((line_r8(py) & 0x02u) != 0u) { return 0xFFu; }
 
     // Per V9938 spec §1.2 sprite mode 1 (SCREEN 1/2/3 - G1/G2/MC):
     //   R#5  : |A14|A13|A12|A11|A10|A9|A8|A7|  — all 8 bits used
@@ -539,8 +548,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 // are silently skipped (we don't yet update the 9S status flag).
 fn sample_sprite_mode2(px: u32, py: u32) -> u32 {
     // R8 bit 1 (SPD) = sprite display disable. Per V9938 spec §2.2 and
-    // fMSX MSX.h `SpritesOFF` macro: when set, sprites are hidden.
-    if ((reg(8u) & 0x02u) != 0u) { return 0xFFu; }
+    // fMSX MSX.h `SpritesOFF` macro: when set, sprites are hidden. Per-scanline
+    // snapshot (active-scan value), not the end-of-frame register — see the
+    // sample_sprite (mode 1) note: VBlank-time SPD=1 from SAT-rewriting ISRs
+    // would otherwise blank sprites and cause flicker.
+    if ((line_r8(py) & 0x02u) != 0u) { return 0xFFu; }
 
     // Per-scanline R5 / R6 / R11: V9938 software often points to a
     // different SAT for different bands of the screen via line interrupts.
@@ -603,7 +615,7 @@ fn sample_sprite_mode2(px: u32, py: u32) -> u32 {
         let dy = i32(py) - sy;
         if (dy < 0 || dy >= i32(box_size)) { continue; }
         count = count + 1u;
-        if (count > 8u) { break; }   // 9th+ sprite on this line is dropped
+        if (count > 8u) { break; }   // 9th+ sprite dropped on real HW
         marked = marked | (1u << s);
     }
 
@@ -779,7 +791,7 @@ fn shade_g4(px: u32, py: u32) -> u32 {
     // intended backdrop is programmed into R7, so without this the surround
     // renders palette[0] (usually black) instead of the logo's backdrop.
     // Per-scanline R7 keeps it consistent with the side-border colour.
-    if (bg == 0u && (reg(8u) & 0x20u) == 0u) {
+    if (bg == 0u && (line_r8(py) & 0x20u) == 0u) {
         bg = line_r7(py) & 0x0Fu;
     }
 

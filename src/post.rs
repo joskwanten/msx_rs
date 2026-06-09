@@ -63,6 +63,8 @@ struct PostUniforms {
     /// crisper). Unused by Sharp / Pixely but lives in the shared uniform
     /// block so the layout matches across all three shaders.
     crt_blur: f32,
+    /// Padding to align `backdrop` to a 16-byte boundary. Unused by the
+    /// shaders.
     _pad: f32,
     backdrop: [f32; 4],
 }
@@ -174,6 +176,7 @@ impl Post {
             ],
         });
 
+        // Both upscale bind groups sample the intermediate the VDP rendered.
         let bind_group_nearest = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("post BG nearest"),
             layout: &bgl,

@@ -501,7 +501,16 @@ impl State {
     /// of how often this is called — a 60 Hz monitor produces 1 frame per
     /// call, a 30 Hz monitor 2 frames per call, and a 16 ms-then-1 ms
     /// invocation pattern still nets out to 60 frames per second.
-    fn step_to_realtime(&mut self) {
+    ///
+    /// Returns how many MSX frames were emulated this call. The caller uses
+    /// this to present exactly one surface frame per emulated frame: when the
+    /// host refresh runs faster than 60 Hz (or `about_to_wait` fires several
+    /// times per emulated frame), a zero-frame call must NOT trigger a redraw
+    /// — re-presenting the same VRAM at an irregular phase relative to the
+    /// emulation is what turns a game's steady 30 Hz sprite-flicker (Vampire
+    /// Killer et al.) into visible strobing. Showing each emulated frame once
+    /// keeps the flicker cadence regular, matching real hardware.
+    fn step_to_realtime(&mut self) -> u32 {
         let now = Instant::now();
         let elapsed = now
             .duration_since(self.last_step)
@@ -510,10 +519,31 @@ impl State {
         self.last_step = now;
 
         self.msx_frame_accumulator += elapsed * MSX_HZ;
-        while self.msx_frame_accumulator >= 1.0 {
+
+        // Step AT MOST one emulated frame per call. The render pass that
+        // follows presents whatever VRAM this frame produced; if we stepped
+        // two frames here the first frame's VRAM would be overwritten before
+        // it was ever drawn, silently dropping it. For software
+        // sprite-multiplexing games (Vampire Killer) every frame is a distinct
+        // phase of the sprite rotation, so a dropped frame is a dropped phase
+        // — exactly the flicker we were chasing. Windows' coarse WaitUntil
+        // timer makes `elapsed` jitter between ~16 ms and ~31 ms, which under
+        // the old while-loop produced an irregular 1-then-2 frame cadence and
+        // thus an irregular drop pattern.
+        //
+        // Keep the fractional remainder in the accumulator so the long-run
+        // rate stays exactly MSX_HZ, but clamp it so a long stall (alt-tab,
+        // breakpoint) can't bank dozens of frames and then fast-forward.
+        let mut frames_stepped = 0;
+        if self.msx_frame_accumulator >= 1.0 {
             self.step_frame();
             self.msx_frame_accumulator -= 1.0;
+            frames_stepped += 1;
         }
+        if self.msx_frame_accumulator > 1.0 {
+            self.msx_frame_accumulator = 1.0;
+        }
+        frames_stepped
     }
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
@@ -844,8 +874,18 @@ impl ApplicationHandler for App {
         // occluded — `render()` doesn't fire in those cases, but `about_to_wait`
         // does. `step_to_realtime` itself is rate-limited by wall clock, so
         // calling it on every loop iteration is fine.
-        state.step_to_realtime();
-        state.window.request_redraw();
+        //
+        // Only request a redraw when at least one new MSX frame was emulated.
+        // Frame-locking presentation to emulation this way stops the renderer
+        // from re-presenting unchanged VRAM at the host refresh rate, which
+        // (on >60 Hz displays especially) sampled the emulation at an
+        // irregular phase and made per-frame sprite flicker strobe. With this
+        // gate each emulated frame is shown exactly once; vsync simply holds
+        // the last frame when the host refresh outruns 60 Hz.
+        let frames_stepped = state.step_to_realtime();
+        if frames_stepped > 0 {
+            state.window.request_redraw();
+        }
 
         // Schedule the next wake-up one MSX frame from now. When the window
         // is visible, vsync paces us anyway; when hidden, this keeps the loop

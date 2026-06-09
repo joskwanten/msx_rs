@@ -92,6 +92,8 @@ static PALETTE: std::sync::LazyLock<[[f32; 4]; 16]> = std::sync::LazyLock::new(|
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
     framebuffer_size: [f32; 2],
+    // Alignment padding so the following vec4<u32> register block starts on a
+    // 16-byte boundary. Reserved for future shader flags.
     _pad: [u32; 2],
     // R0-R23 in 6 vec4<u32> chunks. R8-R23 are V9938-only control regs
     // (mode bits, palette pointer, command engine setup), used by the
@@ -119,13 +121,28 @@ struct Uniforms {
     //   bits  0..7  = R3  (colour table base, low byte)
     //   bits  8..15 = R4  (pattern generator table base)
     //   bits 16..23 = R10 (colour table extension, G3+ high address bits)
-    //   bits 24..31 = reserved
+    //   bits 24..31 = R8  (SPD sprite-disable + TP colour-0 transparency)
     scanline_regs3: [[u32; 4]; 64],
     palette: [[f32; 4]; 16],
 }
 
 pub struct Vdp {
     pub vram: Box<[u8; VRAM_SIZE]>,
+
+    /// VRAM as it was at the END OF THE VISIBLE SCAN (captured in
+    /// `start_vblank`), i.e. exactly the bytes the beam scanned out this
+    /// frame. This — not the live `vram` — is what we upload to the GPU.
+    ///
+    /// Why: a frame's VBlank ISR runs AFTER the visible scan and rewrites
+    /// VRAM to set up the NEXT frame. Uploading the live (post-ISR) VRAM
+    /// shows that next-frame setup one frame early. Software sprite-
+    /// multiplexers (Vampire Killer) recycle a sprite-colour-table slot in
+    /// the ISR right after displaying it — so the post-ISR VRAM has the
+    /// just-shown sprite blanked, producing irregular sprite flicker that
+    /// real hardware never shows. The per-scanline register snapshots are
+    /// already captured at this same end-of-visible point; snapshotting
+    /// VRAM here keeps the two consistent.
+    vram_display: Box<[u8; VRAM_SIZE]>,
 
     /// All VDP registers. R0-R7 are the TMS9918 set (still drive rendering
     /// today). R8-R23 are V9938 control registers — stored but unused by
@@ -234,6 +251,7 @@ pub struct LineSnapshot {
     pub r5: u8,
     pub r6: u8,
     pub r7: u8,
+    pub r8: u8,
     pub r10: u8,
     pub r11: u8,
     pub r23: u8,
@@ -385,6 +403,7 @@ impl Vdp {
 
         Self {
             vram: Box::new([0u8; VRAM_SIZE]),
+            vram_display: Box::new([0u8; VRAM_SIZE]),
             regs: [0u8; 64],
             vram_address: 0,
             status: [0u8; 10],
@@ -406,7 +425,7 @@ impl Vdp {
     }
 
     pub fn upload(&self, queue: &wgpu::Queue, framebuffer_size: (u32, u32)) {
-        queue.write_buffer(&self.vram_buf, 0, &self.vram[..]);
+        queue.write_buffer(&self.vram_buf, 0, &self.vram_display[..]);
 
         // Pack R0-R23 into 6 vec4<u32> chunks. The shader needs R10/R11
         // for G3 base-address extensions and R14 (extended VRAM bank) for
@@ -437,13 +456,14 @@ impl Vdp {
             scanline_packed2[line / 4][line % 4] = packed2;
             let packed3 = (snap.r3 as u32)
                 | ((snap.r4 as u32) << 8)
-                | ((snap.r10 as u32) << 16);
+                | ((snap.r10 as u32) << 16)
+                | ((snap.r8 as u32) << 24);
             scanline_packed3[line / 4][line % 4] = packed3;
         }
 
         let uniforms = Uniforms {
             framebuffer_size: [framebuffer_size.0 as f32, framebuffer_size.1 as f32],
-            _pad: [0; 2],
+            _pad: [0, 0],
             regs: regs_packed,
             scanline_regs: scanline_packed,
             scanline_regs2: scanline_packed2,
@@ -478,6 +498,11 @@ impl Vdp {
             2 => self.update_sprite_status_mode2(),
             _ => {}
         }
+        // Latch the VRAM the beam actually scanned out this frame, BEFORE
+        // the VBlank ISR (which runs in the remaining frame budget) rewrites
+        // it for the next frame. `upload` sends this, not the live VRAM.
+        self.vram_display.copy_from_slice(&self.vram[..]);
+
         self.status[0] |= 0x80;
         // S2 bit 6 (VR) = "vertical retrace in progress". Beam-racing
         // V9938 code polls this to detect the start of VBlank rather
@@ -961,6 +986,7 @@ impl Vdp {
                 r5: self.regs[5],
                 r6: self.regs[6],
                 r7: self.regs[7],
+                r8: self.regs[8],
                 r10: self.regs[10],
                 r11: self.regs[11],
                 r23: self.regs[23],
