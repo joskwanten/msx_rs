@@ -770,7 +770,18 @@ fn shade_g4(px: u32, py: u32) -> u32 {
     let byte = vram_byte(byte_addr);
     // High nibble (px even) is the leftmost pixel.
     let shift = (1u - (px & 1u)) * 4u;
-    let bg = (byte >> shift) & 0x0Fu;
+    var bg = (byte >> shift) & 0x0Fu;
+
+    // Colour-0 transparency (R8 bit 5 = TP). When TP is clear (the reset
+    // default) a bitmap pixel of value 0 is transparent and shows the
+    // backdrop colour (R7) rather than palette entry 0. Konami MSX2 boot
+    // logos rely on this: the logo background is left as colour 0 and the
+    // intended backdrop is programmed into R7, so without this the surround
+    // renders palette[0] (usually black) instead of the logo's backdrop.
+    // Per-scanline R7 keeps it consistent with the side-border colour.
+    if (bg == 0u && (reg(8u) & 0x20u) == 0u) {
+        bg = line_r7(py) & 0x0Fu;
+    }
 
     // G4 uses V9938 sprite mode 2.
     let sprite = sample_sprite_mode2(px, py);
