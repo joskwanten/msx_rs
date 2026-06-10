@@ -1065,21 +1065,20 @@ impl Vdp {
     /// pick clear colours so window letterboxing matches the in-canvas border
     /// seamlessly. Palette index 0 (transparent) collapses to opaque black.
     pub fn backdrop_rgba(&self) -> [f32; 4] {
+        // Exactly the shader's border lookup (`u.palette[backdrop()]`): the
+        // live programmable palette indexed by R7's low nibble, so the
+        // window letterbox always matches the in-canvas border. Index 0 is
+        // NOT special-cased — per fMSX (Common.h RefreshBorder path,
+        // `XPal[0]=(!BGColor||SolidColor0)? XPal0:...`) border colour 0
+        // shows the game's programmed palette entry 0. Contra's Konami
+        // logo relies on this: R7=0x00 with palette[0] = white.
+        // Alpha is clamped to 1.0 because the palette's initial entry 0
+        // carries alpha 0 (transparent), which as a clear colour would let
+        // the page background bleed through on the web build.
         let idx = (self.regs[7] & 0x0F) as usize;
-        if idx == 0 {
-            // Transparent → black: a clear colour with alpha 0 would let the
-            // browser's page background show through on the web build.
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                [srgb_to_linear(0.0), srgb_to_linear(0.0), srgb_to_linear(0.0), 1.0]
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                [0.0, 0.0, 0.0, 1.0]
-            }
-        } else {
-            PALETTE[idx]
-        }
+        let mut c = self.palette[idx];
+        c[3] = 1.0;
+        c
     }
 
     /// Hand-crafted Screen 2 state: eight vertical colored bars in the middle of the screen,
@@ -2094,6 +2093,14 @@ impl<'a> CmdCtx<'a> {
         // TR = transfer ready (CPU may write the first pixel).
         // CE = command executing (stays set until the rectangle is full).
         self.status[2] |= 0x81;
+        // The first pixel is the R44 value staged *before* the command was
+        // issued — the V9938 writes it at issue time, and the CPU then
+        // streams the remaining NX*NY-1 pixels. fMSX models this with the
+        // `VdpEngine()` call at the end of VDPDraw. Without it every
+        // streamed pixel lands one slot early and the rectangle's last
+        // pixel is filled by an unrelated later R44 write.
+        let first = self.regs[44];
+        self.pump_write(first);
     }
 
     /// HMMC — High-speed Move CPU → VRAM. Like LMMC but byte-granular:
@@ -2105,6 +2112,13 @@ impl<'a> CmdCtx<'a> {
         *self.cpu_xfer_x = 0;
         *self.cpu_xfer_y = 0;
         self.status[2] |= 0x81;
+        // First byte comes from R44 as staged before the command write —
+        // see cmd_lmmc. Contra streams its tile sheet with one big HMMC;
+        // missing this byte shifted the whole sheet left by one byte and
+        // left the last byte of the rectangle to be claimed by the next
+        // command's R44 setup write.
+        let first = self.regs[44];
+        self.pump_write(first);
     }
 
     /// LMCM — Logical Move VRAM → CPU. CPU drains pixels by reading
@@ -2357,6 +2371,7 @@ mod tests {
         let mut cpu_xfer = CpuXfer::None;
         let mut cpu_xfer_x = 0u32;
         let mut cpu_xfer_y = 0u32;
+        let mut cmd_busy = 0i32;
         {
             let mut ctx = CmdCtx {
                 regs: &mut regs,
@@ -2365,6 +2380,7 @@ mod tests {
                 cpu_xfer: &mut cpu_xfer,
                 cpu_xfer_x: &mut cpu_xfer_x,
                 cpu_xfer_y: &mut cpu_xfer_y,
+                cmd_busy: &mut cmd_busy,
             };
             setup(&mut ctx);
         }
@@ -2377,6 +2393,7 @@ mod tests {
         let mut cpu_xfer = CpuXfer::None;
         let mut cpu_xfer_x = 0u32;
         let mut cpu_xfer_y = 0u32;
+        let mut cmd_busy = 0i32;
         let ctx = CmdCtx {
             regs: &mut regs.clone(),
             vram: &mut vram,
@@ -2384,6 +2401,7 @@ mod tests {
             cpu_xfer: &mut cpu_xfer,
             cpu_xfer_x: &mut cpu_xfer_x,
             cpu_xfer_y: &mut cpu_xfer_y,
+            cmd_busy: &mut cmd_busy,
         };
         let layout = ctx.pixel_layout().expect("G4 must classify");
         assert_eq!(layout.bpp, 4);
@@ -2406,8 +2424,54 @@ mod tests {
         assert_eq!(vram[1], 0xAB);
         assert_eq!(vram[128], 0xAB);
         assert_eq!(vram[129], 0xAB);
-        // CE cleared on completion.
-        assert_eq!(status[2] & 0x01, 0);
+        // The VRAM effect is synchronous but the engine stays "busy" (CE
+        // set) for the modeled command duration; Vdp::tick clears it once
+        // the duration elapses.
+        assert_eq!(status[2] & 0x01, 1);
+    }
+
+    /// HMMC's first byte is the R44 value staged before the command is
+    /// issued (V9938 protocol; fMSX writes it from the VdpEngine() call at
+    /// the end of VDPDraw). The CPU then streams the remaining bytes.
+    /// Regression test for Contra's tile-sheet upload: missing the issue-
+    /// time byte shifted every tile by one byte and corrupted the last
+    /// two pixels of the rectangle.
+    #[test]
+    fn hmmc_writes_r44_at_issue_then_streams_rest() {
+        let (_regs, vram, status) = with_g4(|ctx| {
+            // 4×2-pixel rect at (0,0) → 2 bytes per row, 4 bytes total.
+            ctx.regs[40] = 4; ctx.regs[41] = 0;   // NX = 4 pixels
+            ctx.regs[42] = 2; ctx.regs[43] = 0;   // NY = 2
+            ctx.regs[44] = 0x11;                  // first data byte, pre-staged
+            ctx.regs[46] = 0xF0;                  // HMMC
+            ctx.execute();
+            // CPU streams the remaining 3 bytes via R44 writes.
+            for &b in &[0x22, 0x33, 0x44] {
+                ctx.regs[44] = b;
+                ctx.pump_write(b);
+            }
+        });
+        assert_eq!(&vram[0..2], &[0x11, 0x22]);
+        assert_eq!(&vram[128..130], &[0x33, 0x44]);
+        // Transfer complete: TR and CE both cleared.
+        assert_eq!(status[2] & 0x81, 0);
+    }
+
+    /// Same first-pixel-at-issue semantics for LMMC (pixel-granular).
+    #[test]
+    fn lmmc_writes_r44_at_issue_then_streams_rest() {
+        let (_regs, vram, status) = with_g4(|ctx| {
+            ctx.regs[40] = 2; ctx.regs[41] = 0;   // NX = 2 pixels
+            ctx.regs[42] = 1; ctx.regs[43] = 0;   // NY = 1
+            ctx.regs[44] = 0x01;                  // first pixel, pre-staged
+            ctx.regs[46] = 0xB0;                  // LMMC / IMP
+            ctx.execute();
+            ctx.regs[44] = 0x02;
+            ctx.pump_write(0x02);
+        });
+        // G4: two pixels in one byte, first pixel in the high nibble.
+        assert_eq!(vram[0], 0x12);
+        assert_eq!(status[2] & 0x81, 0);
     }
 
     #[test]
@@ -2427,6 +2491,7 @@ mod tests {
         let mut cpu_xfer = CpuXfer::None;
         let mut cpu_xfer_x = 0u32;
         let mut cpu_xfer_y = 0u32;
+        let mut cmd_busy = 0i32;
         let ctx = CmdCtx {
             regs: &mut regs2,
             vram: &mut v2,
@@ -2434,6 +2499,7 @@ mod tests {
             cpu_xfer: &mut cpu_xfer,
             cpu_xfer_x: &mut cpu_xfer_x,
             cpu_xfer_y: &mut cpu_xfer_y,
+            cmd_busy: &mut cmd_busy,
         };
         let layout = ctx.pixel_layout().unwrap();
         assert_eq!(ctx.read_pixel(&layout, 0, 0), 0);
