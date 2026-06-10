@@ -16,6 +16,7 @@
 #![allow(dead_code)] // WIP module — warnings will fade once main.rs wires it up.
 
 use crate::ppi::Ppi;
+use crate::rtc::Rtc;
 use crate::scc::Scc;
 use crate::slot::{
     detect_mapper, CartridgeMapper, KonamiMegaRomCartridge, KonamiMegaRomSccCartridge,
@@ -25,6 +26,15 @@ use crate::vdp::Vdp;
 use psg::PSG;
 use std::num::NonZeroU16;
 use std::sync::{Arc, Mutex};
+
+/// Which system ROM set to boot. C-BIOS is compiled in and always
+/// available; the NMS-8245 variant carries the Philips ROM images loaded
+/// from disk at startup (native builds only — see `load_machine_roms` in
+/// main.rs).
+pub enum MachineRoms {
+    CBios,
+    Nms8245 { main: Vec<u8>, ext: Vec<u8> },
+}
 
 /// Build the slot contents for a cartridge: detect the mapper and wrap the
 /// ROM in the matching `Slot` variant, or return `Slot::Empty` when no ROM
@@ -94,6 +104,9 @@ pub struct Bus {
     pub slots: Slots,
     pub vdp: Vdp,
     pub ppi: Ppi,
+    /// RP-5C01 real-time clock (ports 0xB4/0xB5). The real MSX2 BIOS
+    /// keeps its boot settings in the chip's CMOS banks — see rtc.rs.
+    rtc: Rtc,
     psg: Arc<Mutex<PSG>>,
     /// Last value written to port 0xA0 — selects which of the PSG's 14
     /// registers the next 0xA1 write or 0xA2 read targets.
@@ -106,49 +119,84 @@ impl Bus {
         psg: Arc<Mutex<PSG>>,
         scc: Arc<Mutex<Scc>>,
         cartridge_rom: Option<Vec<u8>>,
+        machine: MachineRoms,
     ) -> Self {
-        // MSX2 slot layout (C-BIOS-style):
-        //   Slot 0:    C-BIOS MSX2 Main — 32 KiB BIOS at 0x0000.
-        //   Slot 1:    external cartridge socket — game ROM when provided,
-        //              empty otherwise. Drag-and-drop swaps this slot at runtime.
-        //   Slot 2:    C-BIOS BASIC — 16 KiB cartridge-style ROM at 0x4000.
-        //              Slot-scan order means a game in slot 1 wins; without
-        //              one, BASIC fires.
-        //   Slot 3:    expanded —
-        //              3-0: empty
-        //              3-1: C-BIOS Sub-ROM (display/SCREEN 4-8 helpers, 16 KiB
-        //                   at 0x0000). The main BIOS pages it in via inter-
-        //                   slot calls (CALSLT) when it needs the V9938-specific
-        //                   routines.
-        //              3-2: empty
-        //              3-3: V9938 RAM mapper — 256 KiB pool addressed through
-        //                   four 16 KiB banks (ports 0xFC-0xFF). MSX2 BIOS
-        //                   uses 64 KiB linear at boot via the mapper's
-        //                   default 3/2/1/0 setup; games that need more
-        //                   reprogramme the banks.
-        let bios = RomSlot::new(Box::from(CBIOS_MAIN), 0x0000);
-        let basic = RomSlot::new(Box::from(CBIOS_BASIC), 0x4000);
-        let sub_rom = RomSlot::new(Box::from(CBIOS_SUB), 0x0000);
-
-        let slot3 = SubslottedSlot::new([
-            Slot::Empty,                   // 3-0
-            Slot::Rom(sub_rom),            // 3-1 ← C-BIOS Sub-ROM
-            Slot::Empty,                   // 3-2
-            Slot::MappedRam(MappedRamSlot::new()),  // 3-3 ← V9938 RAM mapper (256 KiB)
-        ]);
-
         let cartridge_slot = build_cartridge_slot(cartridge_rom, scc);
-
-        let slots = Slots::new([
-            Slot::Rom(bios),
-            cartridge_slot,
-            Slot::Rom(basic),
-            Slot::Subslotted(Box::new(slot3)),
-        ]);
+        let slots = match machine {
+            // MSX2 slot layout (C-BIOS-style):
+            //   Slot 0:    C-BIOS MSX2 Main — 32 KiB BIOS at 0x0000.
+            //   Slot 1:    external cartridge socket — game ROM when provided,
+            //              empty otherwise. Drag-and-drop swaps this slot at runtime.
+            //   Slot 2:    C-BIOS BASIC — 16 KiB cartridge-style ROM at 0x4000.
+            //              Slot-scan order means a game in slot 1 wins; without
+            //              one, BASIC fires.
+            //   Slot 3:    expanded —
+            //              3-0: empty
+            //              3-1: C-BIOS Sub-ROM (display/SCREEN 4-8 helpers, 16 KiB
+            //                   at 0x0000). The main BIOS pages it in via inter-
+            //                   slot calls (CALSLT) when it needs the V9938-specific
+            //                   routines.
+            //              3-2: empty
+            //              3-3: V9938 RAM mapper — 256 KiB pool addressed through
+            //                   four 16 KiB banks (ports 0xFC-0xFF). MSX2 BIOS
+            //                   uses 64 KiB linear at boot via the mapper's
+            //                   default 3/2/1/0 setup; games that need more
+            //                   reprogramme the banks.
+            MachineRoms::CBios => {
+                let bios = RomSlot::new(Box::from(CBIOS_MAIN), 0x0000);
+                let basic = RomSlot::new(Box::from(CBIOS_BASIC), 0x4000);
+                let sub_rom = RomSlot::new(Box::from(CBIOS_SUB), 0x0000);
+                let slot3 = SubslottedSlot::new([
+                    Slot::Empty,                           // 3-0
+                    Slot::Rom(sub_rom),                    // 3-1 ← C-BIOS Sub-ROM
+                    Slot::Empty,                           // 3-2
+                    Slot::MappedRam(MappedRamSlot::new()), // 3-3 ← RAM mapper
+                ]);
+                Slots::new([
+                    Slot::Rom(bios),
+                    cartridge_slot,
+                    Slot::Rom(basic),
+                    Slot::Subslotted(Box::new(slot3)),
+                ])
+            }
+            // Philips NMS-8245 layout (per the ROM set's NMS8245.TXT):
+            //   Slot 0:    MSX2.ROM — BIOS + BASIC 2.1, 32 KiB at 0x0000.
+            //              (BASIC lives inside the main ROM at 0x4000, so no
+            //              separate BASIC cartridge like C-BIOS uses.)
+            //   Slot 1/2:  cartridge sockets — game in 1, 2 left empty.
+            //   Slot 3:    expanded —
+            //              3-0: MSX2EXT.ROM — Extended BASIC / Sub-ROM,
+            //                   16 KiB at 0x0000.
+            //              3-2: RAM mapper (real machine: 128 KiB; our pool
+            //                   is 256 KiB which the BIOS sizes by probing).
+            //              3-3: empty. The real machine has DISK.ROM here
+            //                   (Disk BASIC at 0x4000) — deliberately not
+            //                   mounted: its driver talks to a WD2793 FDC on
+            //                   memory-mapped registers we don't emulate, and
+            //                   open-bus 0xFF reads as "forever busy", which
+            //                   wedges the boot. Mount it when an FDC lands.
+            MachineRoms::Nms8245 { main, ext } => {
+                let bios = RomSlot::new(main.into_boxed_slice(), 0x0000);
+                let sub_rom = RomSlot::new(ext.into_boxed_slice(), 0x0000);
+                let slot3 = SubslottedSlot::new([
+                    Slot::Rom(sub_rom),                    // 3-0 ← MSX2EXT.ROM
+                    Slot::Empty,                           // 3-1
+                    Slot::MappedRam(MappedRamSlot::new()), // 3-2 ← RAM mapper
+                    Slot::Empty,                           // 3-3 (disk, see above)
+                ]);
+                Slots::new([
+                    Slot::Rom(bios),
+                    cartridge_slot,
+                    Slot::Empty,
+                    Slot::Subslotted(Box::new(slot3)),
+                ])
+            }
+        };
         Self {
             slots,
             vdp,
             ppi: Ppi::new(),
+            rtc: Rtc::new(),
             psg,
             psg_reg_select: 0,
         }
@@ -195,6 +243,7 @@ impl Io for Bus {
             0x98 | 0x99 => self.vdp.in8(port),
             0xA2 => 0xFF, // PSG port-B read (not wired up yet)
             0xA8 => self.slots.slot_register,
+            0xB5 => self.rtc.read(),
             0xA9 => self.ppi.read_row(), // keyboard row state
             // V9938 RAM mapper: bank-select register read-back. Returns
             // the bank index ORed with 0xF0 so software detects this is
@@ -227,6 +276,9 @@ impl Io for Bus {
                 .unwrap()
                 .set_register(self.psg_reg_select, value),
             0xA8 => self.slots.slot_register = value,
+            // RP-5C01 real-time clock: register select + data.
+            0xB4 => self.rtc.select(value),
+            0xB5 => self.rtc.write(value),
             // PPI port C: low nibble = keyboard row select, high nibble
             // would drive CAPS LED / kana indicator (ignored here).
             0xAA => self.ppi.write_port_c(value),

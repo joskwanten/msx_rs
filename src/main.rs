@@ -3,6 +3,7 @@ mod bus;
 mod log;
 mod post;
 mod ppi;
+mod rtc;
 mod scc;
 mod slot;
 mod vdp;
@@ -95,6 +96,46 @@ fn load_cartridge_rom() -> Option<Vec<u8>> {
         Err(e) => {
             eprintln!("failed to read cartridge ROM {}: {}", path, e);
             std::process::exit(1);
+        }
+    }
+}
+
+/// Pick the system ROM set. `MSX_BIOS=nms8245` (or a path to a directory
+/// holding `MSX2.ROM` + `MSX2EXT.ROM`) boots the real Philips NMS-8245
+/// BIOS; anything else — including unset — boots the embedded C-BIOS.
+/// Falls back to C-BIOS with a warning when the files can't be read, so a
+/// missing ROM set never breaks startup.
+#[cfg(not(target_arch = "wasm32"))]
+fn load_machine_roms() -> bus::MachineRoms {
+    let Some(choice) = std::env::var_os("MSX_BIOS") else {
+        return bus::MachineRoms::CBios;
+    };
+    let dir = match choice.to_str() {
+        Some("nms8245") => std::path::PathBuf::from("assets/NMS8245"),
+        Some(path) => std::path::PathBuf::from(path),
+        None => return bus::MachineRoms::CBios,
+    };
+    let main = std::fs::read(dir.join("MSX2.ROM"));
+    let ext = std::fs::read(dir.join("MSX2EXT.ROM"));
+    match (main, ext) {
+        (Ok(main), Ok(ext)) if main.len() == 0x8000 && ext.len() == 0x4000 => {
+            eprintln!("bios: NMS-8245 ROMs from {}", dir.display());
+            bus::MachineRoms::Nms8245 { main, ext }
+        }
+        (Ok(m), Ok(e)) => {
+            eprintln!(
+                "bios: {} ROM sizes wrong (main {} ext {}), falling back to C-BIOS",
+                dir.display(), m.len(), e.len()
+            );
+            bus::MachineRoms::CBios
+        }
+        (m, e) => {
+            eprintln!(
+                "bios: could not read ROMs from {} ({}), falling back to C-BIOS",
+                dir.display(),
+                m.err().or(e.err()).map(|e| e.to_string()).unwrap_or_default()
+            );
+            bus::MachineRoms::CBios
         }
     }
 }
@@ -253,6 +294,13 @@ struct State {
     post: Post,
     /// Currently active post-process shader. Toggled at runtime via Alt+S.
     shader_mode: ShaderMode,
+    /// Crash-hunting aid (MSX_PCTRACE=2): ring buffer of the most recent
+    /// instruction PCs. Dumped when the PC falls back to the reset vector
+    /// region (< 0x10) from running code — i.e. an unexpected reboot — so
+    /// the trace shows the wild-jump path that led there.
+    pc_ring: Vec<u16>,
+    pc_ring_idx: usize,
+    pc_prev: u16,
 }
 
 impl State {
@@ -349,11 +397,19 @@ impl State {
         eprintln!("shader: {}", shader_mode.label());
 
         let audio = Audio::new();
+        // System ROM choice: env-selected NMS-8245 set on native, always
+        // C-BIOS on web (no filesystem there).
+        #[cfg(not(target_arch = "wasm32"))]
+        let machine = load_machine_roms();
+        #[cfg(target_arch = "wasm32")]
+        let machine = bus::MachineRoms::CBios;
+
         let bus = Bus::new(
             vdp,
             Arc::clone(&audio.psg),
             Arc::clone(&audio.scc),
             cartridge_rom,
+            machine,
         );
 
         // Default::default() on Z80NMOS gives all-zero registers — including
@@ -380,6 +436,9 @@ impl State {
             audio,
             post,
             shader_mode,
+            pc_ring: vec![0u16; 64],
+            pc_ring_idx: 0,
+            pc_prev: 0,
         }
     }
 
@@ -479,6 +538,28 @@ impl State {
             if !vblank_fired && self.clock.0.0 >= visible_end_clock {
                 self.bus.vdp.start_vblank();
                 vblank_fired = true;
+            }
+
+            // MSX_PCTRACE=2: per-instruction ring buffer + reboot detector.
+            // (=1 keeps the cheaper one-sample-per-frame mode below.)
+            static PCTRACE_RING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let ring_on = *PCTRACE_RING.get_or_init(|| {
+                std::env::var_os("MSX_PCTRACE").is_some_and(|v| v == *"2")
+            });
+            if ring_on {
+                let pc = self.cpu.get_pc();
+                self.pc_ring[self.pc_ring_idx] = pc;
+                self.pc_ring_idx = (self.pc_ring_idx + 1) % self.pc_ring.len();
+                if pc < 0x10 && self.pc_prev >= 0x100 {
+                    let mut trail: Vec<String> = Vec::with_capacity(self.pc_ring.len());
+                    for i in 0..self.pc_ring.len() {
+                        let idx = (self.pc_ring_idx + i) % self.pc_ring.len();
+                        trail.push(format!("{:04X}", self.pc_ring[idx]));
+                    }
+                    eprintln!("[reboot] PC {:04X} -> {:04X}; trail: {}",
+                              self.pc_prev, pc, trail.join(" "));
+                }
+                self.pc_prev = pc;
             }
 
             let before = self.clock.0.0;

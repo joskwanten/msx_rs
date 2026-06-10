@@ -78,8 +78,25 @@ fn reg(i: u32) -> u32 {
     }
 }
 
+// Border colour index from R7, mode-aware: in G5 (SCREEN 6, 2bpp) the
+// border nibble holds TWO 2-bit colours (bits 3:2 even dots, 1:0 odd
+// dots) instead of one 4-bit index. The MSX2 BIOS logo sets R7=0x05 =
+// palette[1] (blue) there; a plain &0x0F lookup painted palette[5]
+// (light blue). We use the odd-dot field; solid borders set both equal.
+fn border_index(r0: u32, r1: u32, r7: u32) -> u32 {
+    let m1 = (r1 >> 4u) & 1u;
+    let m2 = (r1 >> 3u) & 1u;
+    let m3 = (r0 >> 1u) & 1u;
+    let m4 = (r0 >> 2u) & 1u;
+    let m5 = (r0 >> 3u) & 1u;
+    if (m5 == 1u && m4 == 0u && m3 == 0u && m2 == 0u && m1 == 0u) {
+        return r7 & 0x03u; // G5: 2-bit odd-dot colour
+    }
+    return r7 & 0x0Fu;
+}
+
 fn backdrop() -> u32 {
-    return reg(7u) & 0x0Fu;
+    return border_index(reg(0u), reg(1u), reg(7u));
 }
 
 // ─── Per-scanline registers ───────────────────────────────────────────────
@@ -444,7 +461,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // previously the last-written R7 bled across the whole frame, painting
     // the side borders grey in bands where they should match the playfield.
     let py = canvas_y - 24u;
-    let line_backdrop = line_r7(py) & 0x0Fu;
+    let line_backdrop = border_index(line_r0(py), line_r1(py), line_r7(py));
 
     // Horizontal gate: left/right side borders follow the per-scanline
     // backdrop.
@@ -489,6 +506,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // base-address masks for 128 KiB VRAM. Sprites use V9938 mode 2
         // which is a separate code path (not yet wired up).
         color_idx = shade_g3(px, py);
+    } else if (m5 == 1u && m4 == 0u && m3 == 0u && m2 == 0u && m1 == 0u) {
+        // G5 / Screen 6 — 512×212 2bpp; the MSX2 BIOS boot logo lives here.
+        color_idx = shade_g5(px, py);
     } else if (m4 == 1u || m5 == 1u) {
         color_idx = backdrop();        // other V9938 modes not yet implemented
     } else if (m3 == 1u) {
@@ -762,6 +782,35 @@ fn shade_g3(px: u32, py: u32) -> u32 {
 //   page 2 base = 0x10000
 //   page 3 base = 0x18000
 //
+// G5 (SCREEN 6): 512×212 bitmap, 2 bits per pixel, 4 pixels per byte,
+// 128 bytes per row. Same page/scroll structure as G4 (32 KiB pages via
+// R2 bits 5-6, rows wrap mod 256). Our canvas is 256 wide, so each output
+// pixel samples the even source pixel of its 2-pixel pair — crisp enough
+// for the line art this mode typically carries (the MSX2 BIOS draws its
+// boot logo here with LINE/PSET/LMMC commands).
+fn shade_g5(px: u32, py: u32) -> u32 {
+    let page = (line_r2(py) >> 5u) & 3u;
+    let page_base = page << 15u;
+    let bitmap_y = (py + line_r23(py)) & 0xFFu;
+    let x = px << 1u; // even pixel of the 512-wide pair
+    let byte_addr = page_base + bitmap_y * 128u + (x >> 2u);
+    let byte = vram_byte(byte_addr);
+    // Leftmost pixel lives in bits 7:6.
+    let shift = (3u - (x & 3u)) * 2u;
+    var bg = (byte >> shift) & 0x03u;
+
+    // Colour-0 transparency, same TP rule as G4 (see shade_g4). G5's
+    // backdrop is 2-bit; R7's nibble holds separate even/odd border pixel
+    // colours, we use the odd-pixel bits (plain software sets both equal).
+    if (bg == 0u && (line_r8(py) & 0x20u) == 0u) {
+        bg = line_r7(py) & 0x03u;
+    }
+
+    let sprite = sample_sprite_mode2(px, py);
+    if (sprite < 16u) { return sprite; }
+    return bg;
+}
+
 // Pixel value is a 4-bit palette index → u.palette[idx].
 fn shade_g4(px: u32, py: u32) -> u32 {
     // Per-scanline R2: Quarth (and other MSX2 software) flips the display

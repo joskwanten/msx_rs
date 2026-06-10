@@ -31,30 +31,6 @@ const HBLANK_START_TSTATE: i32 = 170;
 pub const CANVAS_W: u32 = 320;
 pub const CANVAS_H: u32 = 240;
 
-// TMS9918 fixed palette — the user's TypeScript reference, ported from
-// 0xRRGGBBAA u32 literals to normalized RGBA floats. Index 0 is transparent.
-// Values are in *sRGB* color space (matching how the bytes appear on a
-// monitor); we convert them to linear once at startup before uploading,
-// because the wgpu surface does the linear → sRGB gamma curve for us.
-const PALETTE_SRGB: [[f32; 4]; 16] = [
-    [0.0000, 0.0000, 0.0000, 0.0], //  0 transparent
-    [0.0000, 0.0000, 0.0000, 1.0], //  1 black                 #000000
-    [0.1294, 0.7843, 0.2588, 1.0], //  2 medium green          #21C842
-    [0.3686, 0.8627, 0.4706, 1.0], //  3 light green           #5EDC78
-    [0.3294, 0.3333, 0.9294, 1.0], //  4 dark blue             #5455ED
-    [0.4902, 0.4627, 0.9882, 1.0], //  5 light blue            #7D76FC
-    [0.8314, 0.3216, 0.3020, 1.0], //  6 dark red              #D4524D
-    [0.2588, 0.9216, 0.9608, 1.0], //  7 cyan                  #42EBF5
-    [0.9882, 0.3333, 0.3294, 1.0], //  8 medium red            #FC5554
-    [1.0000, 0.4745, 0.4706, 1.0], //  9 light red             #FF7978
-    [0.8314, 0.7569, 0.3294, 1.0], // 10 dark yellow           #D4C154
-    [0.9020, 0.8078, 0.5020, 1.0], // 11 light yellow          #E6CE80
-    [0.1294, 0.6902, 0.2314, 1.0], // 12 dark green            #21B03B
-    [0.7882, 0.3569, 0.7294, 1.0], // 13 magenta               #C95BBA
-    [0.8000, 0.8000, 0.8000, 1.0], // 14 gray                  #CCCCCC
-    [1.0000, 1.0000, 1.0000, 1.0], // 15 white                 #FFFFFF
-];
-
 /// Convert one sRGB-encoded channel value to linear light. Standard formula
 /// from the sRGB IEC 61966-2-1 spec. wgpu's `BGRA8UnormSrgb` surfaces apply
 /// the inverse transform on write, so our shader output needs to be in
@@ -68,33 +44,6 @@ fn srgb_to_linear(c: f32) -> f32 {
         ((c + 0.055) / 1.055).powf(2.4)
     }
 }
-
-/// Palette ready for the shader, computed once at first access.
-///
-/// On *native* macOS the surface format ends up being `Bgra8UnormSrgb`, so
-/// wgpu applies the linear → sRGB gamma curve for us; the shader needs to
-/// hand it linear values, hence the conversion.
-///
-/// On *web* (WebGPU) the surface format is `Bgra8Unorm` — no automatic gamma
-/// curve. The browser treats the canvas's color space as sRGB by default,
-/// which means the framebuffer values it reads back ARE the displayed sRGB
-/// values. So we want to feed the shader the *raw* sRGB palette there.
-static PALETTE: std::sync::LazyLock<[[f32; 4]; 16]> = std::sync::LazyLock::new(|| {
-    // `mut` is needed on native (the iter_mut loop below); on wasm32 the
-    // loop is cfg'd out and `out` is never mutated. Silence the unused-mut
-    // warning specifically for that target instead of restructuring.
-    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
-    let mut out = PALETTE_SRGB;
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        for entry in out.iter_mut() {
-            entry[0] = srgb_to_linear(entry[0]);
-            entry[1] = srgb_to_linear(entry[1]);
-            entry[2] = srgb_to_linear(entry[2]);
-        }
-    }
-    out
-});
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -177,7 +126,7 @@ pub struct Vdp {
     has_latched_data: bool,
 
     /// V9938 16-entry palette, already in the vec4<f32> RGBA format the
-    /// shader consumes. Initialised from the fixed [`PALETTE`] table at
+    /// shader consumes. Initialised to the V9938 power-on palette at
     /// boot (and on cartridge swap reset) so MSX1 software gets the same
     /// look it always had. MSX2 software replaces individual entries by
     /// writing pairs of bytes to port 0x9A — the conversion from the
@@ -300,8 +249,34 @@ impl Default for CpuXfer {
     }
 }
 
+/// V9938 power-on palette, 3 bits per channel — the colours the chip
+/// presents before any software touches port 0x9A. Matches fMSX's
+/// `PalInit` (values ×32) and the V9938 application manual. Notably
+/// DIFFERENT from the TMS9918 phosphor approximations used previously:
+/// entry 4 (the BIOS boot backdrop) is a deep blue (1,1,7), not the MSX1
+/// light blue — an MSX2 boots with this palette, so initialising from the
+/// TMS table painted the boot screen the wrong shade.
+const V9938_PALETTE_INIT: [[u8; 3]; 16] = [
+    [0, 0, 0], [0, 0, 0], [1, 6, 1], [3, 7, 3],
+    [1, 1, 7], [2, 3, 7], [5, 1, 1], [2, 6, 7],
+    [7, 1, 1], [7, 3, 3], [6, 6, 1], [6, 6, 4],
+    [1, 4, 1], [6, 2, 5], [5, 5, 5], [7, 7, 7],
+];
+
+/// Build the shader-format palette for the V9938 power-on state. Entry 0
+/// keeps alpha 0.0 (transparent), mirroring how the old TMS table
+/// marked colour 0 — consumers that care (web clear colour) clamp it.
+fn v9938_default_palette() -> [[f32; 4]; 16] {
+    let mut out = [[0.0f32; 4]; 16];
+    for (i, [r, g, b]) in V9938_PALETTE_INIT.iter().enumerate() {
+        out[i] = v9938_to_palette_entry(*r, *g, *b);
+    }
+    out[0][3] = 0.0;
+    out
+}
+
 /// Convert a 3-bit-per-channel V9938 palette colour to the same vec4<f32>
-/// RGBA space the shader uses for [`PALETTE`]. The native build feeds the
+/// RGBA space the shader consumes. The native build feeds the
 /// shader linear values (the surface is sRGB), the web build feeds raw
 /// sRGB (surface is Unorm) — same target-conditional path the fixed
 /// palette already follows.
@@ -424,7 +399,7 @@ impl Vdp {
             status: [0u8; 10],
             latched_data: 0,
             has_latched_data: false,
-            palette: *PALETTE,
+            palette: v9938_default_palette(),
             palette_pending: None,
             scanline_snap: Box::new([LineSnapshot::default(); 256]),
             line_irq_pending: false,
@@ -1087,9 +1062,9 @@ impl Vdp {
         self.has_latched_data = false;
         // Reset to TMS9918 defaults so a cartridge swap doesn't leave the
         // next game starting in a black palette. MSX2 software writes its
-        // own colours via 0x9A anyway; MSX1 software gets its expected
-        // look from the start.
-        self.palette = *PALETTE;
+        // own colours via 0x9A anyway; MSX1 software gets the V9938
+        // power-on palette — which is what a real MSX2 shows it.
+        self.palette = v9938_default_palette();
         self.palette_pending = None;
         *self.scanline_snap = [LineSnapshot::default(); 256];
         self.line_irq_pending = false;
@@ -1100,7 +1075,7 @@ impl Vdp {
     }
 
     /// Current backdrop colour as a 4-component RGBA value in the same space
-    /// as [`PALETTE`] — linear on native, sRGB on web. Used by the host to
+    /// as the shader palette — linear on native, sRGB on web. Used by the host to
     /// pick clear colours so window letterboxing matches the in-canvas border
     /// seamlessly. Palette index 0 (transparent) collapses to opaque black.
     pub fn backdrop_rgba(&self) -> [f32; 4] {
@@ -1114,10 +1089,31 @@ impl Vdp {
         // Alpha is clamped to 1.0 because the palette's initial entry 0
         // carries alpha 0 (transparent), which as a clear colour would let
         // the page background bleed through on the web build.
-        let idx = (self.regs[7] & 0x0F) as usize;
+        //
+        // Mode nuance: in G5 (SCREEN 6, 2bpp) R7's border nibble is TWO
+        // 2-bit colours — bits 3:2 for even dots, 1:0 for odd dots — not
+        // one 4-bit index. The MSX2 BIOS logo screen sets R7 = 0x05, i.e.
+        // palette[1] (pure blue) on both dot phases; reading the full
+        // nibble painted palette[5] (light blue) instead. Verified against
+        // a real NMS-8245. We use the odd-dot bits; software that wants a
+        // solid border sets both fields equal.
+        let r7 = self.regs[7];
+        let idx = if self.is_g5_mode() { r7 & 0x03 } else { r7 & 0x0F } as usize;
         let mut c = self.palette[idx];
         c[3] = 1.0;
         c
+    }
+
+    /// True when the display mode is G5 (SCREEN 6): M5 M4 M3 M2 M1 =
+    /// 1 0 0 0 0. Border-colour interpretation differs in this mode —
+    /// see `backdrop_rgba`.
+    fn is_g5_mode(&self) -> bool {
+        let m5 = (self.regs[0] >> 3) & 1;
+        let m4 = (self.regs[0] >> 2) & 1;
+        let m3 = (self.regs[0] >> 1) & 1;
+        let m2 = (self.regs[1] >> 3) & 1;
+        let m1 = (self.regs[1] >> 4) & 1;
+        (m5, m4, m3, m2, m1) == (1, 0, 0, 0, 0)
     }
 
     /// Hand-crafted Screen 2 state: eight vertical colored bars in the middle of the screen,
