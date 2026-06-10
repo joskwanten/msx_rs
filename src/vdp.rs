@@ -16,6 +16,14 @@ use crate::mlog;
 // a real 0x18000, not 0x18000 & 0x3FFF.
 pub const VRAM_SIZE: usize = 128 * 1024;
 
+/// Z80 T-states per scanline (3.58 MHz / 15.7 kHz; fMSX HPERIOD/6 = 228).
+/// Must match the frame loop's scanline constant in main.rs.
+const SCANLINE_TSTATES: i32 = 228;
+/// T-state within the scanline where horizontal blanking begins. The
+/// display portion is HREFRESH_256/6 ≈ 170 T-states (fMSX MSX.h); the
+/// remaining ~58 are HBlank, during which S2's HR bit reads 1.
+const HBLANK_START_TSTATE: i32 = 170;
+
 /// MSX overscan canvas size — the 256×192 active area plus a 32-pixel side
 /// border and 24-pixel top/bottom border filled with the backdrop colour.
 /// The VDP renders into a 320×240 offscreen texture of this size, which the
@@ -212,6 +220,13 @@ pub struct Vdp {
     /// this, our instant completion let Quarth race ahead of the beam and
     /// compute its split registers / write addresses at the wrong time.
     cmd_busy: i32,
+
+    /// T-state position of the beam within the current scanline, advanced
+    /// by `tick` and reset by `reset_scanline_phase` at each frame start.
+    /// Drives the derived HR bit (S2 bit 5, horizontal blank) in
+    /// `read_status` — Space Manbow busy-waits on HR for its in-game
+    /// split-screen timing instead of using the line interrupt.
+    scanline_phase: i32,
 
     /// Set when a line interrupt has fired and the CPU hasn't yet
     /// acknowledged by reading status register S1. Combined with R0[4]
@@ -415,6 +430,7 @@ impl Vdp {
             line_irq_pending: false,
             cpu_xfer: CpuXfer::None,
             cmd_busy: 0,
+            scanline_phase: 0,
             cpu_xfer_x: 0,
             cpu_xfer_y: 0,
             vram_buf,
@@ -999,6 +1015,11 @@ impl Vdp {
     /// the per-instruction step loop. No-op while a CPU-streamed transfer
     /// is active — those clear CE themselves on the final byte.
     pub fn tick(&mut self, dt: i32) {
+        // Track where the beam is within the current scanline so S2's HR
+        // bit (horizontal blank) can be derived on read. 228 T-states per
+        // scanline, the last ~58 are horizontal blanking (fMSX: HPERIOD
+        // 1368 VDP cycles, HREFRESH_256 1024 → 228/170 in T-states).
+        self.scanline_phase = (self.scanline_phase + dt) % SCANLINE_TSTATES;
         if self.cmd_busy > 0 {
             self.cmd_busy -= dt;
             if self.cmd_busy <= 0 {
@@ -1010,12 +1031,30 @@ impl Vdp {
         }
     }
 
+    /// Re-align the scanline-phase counter with the frame clock. Called by
+    /// the frame loop when it resets its T-state clock to zero, so the HR
+    /// window derived in `read_status` stays in step with the line counter
+    /// that drives line IRQs and snapshots.
+    pub fn reset_scanline_phase(&mut self) {
+        self.scanline_phase = 0;
+    }
+
     /// Fire a V9938 line interrupt: set FH (S1 bit 0) and latch the
     /// pending flag that `is_irq_pending` ORs with the VBLANK source.
     /// CPU acknowledges by reading S1 (see `read_status`).
     pub fn fire_line_irq(&mut self) {
         self.status[1] |= 0x01;
         self.line_irq_pending = true;
+    }
+
+    /// Drop FH outside the coincidence line when IE1 is disabled — fMSX
+    /// (MSX.c): `if(!(VDP[0]&0x10)) VDPStatus[1]&=0xFE;` on every non-
+    /// matching line. With IE1 enabled FH instead stays latched until the
+    /// CPU acknowledges by reading S1. Clearing the pending latch too keeps
+    /// a later IE1 enable from firing a stale interrupt.
+    pub fn clear_line_irq_flag(&mut self) {
+        self.status[1] &= !0x01;
+        self.line_irq_pending = false;
     }
 
     /// True when the current scanline matches R19 — i.e. this is where
@@ -1226,6 +1265,15 @@ impl Vdp {
                 self.status[1] &= !0x01; // FH cleared on read
                 self.line_irq_pending = false;
                 v
+            }
+            // S2's HR bit (bit 5, horizontal blank) is derived from the
+            // beam position rather than stored: it pulses every scanline,
+            // and software busy-waits on it for raster timing (Space
+            // Manbow's in-game split). The latched bits (CE/BD/TR/VR)
+            // come from the stored byte as usual.
+            2 => {
+                let hr = if self.scanline_phase >= HBLANK_START_TSTATE { 0x20 } else { 0 };
+                self.status[2] | hr
             }
             // S7 has a side effect during LMCM: each read returns the
             // next pixel and advances the source pointer. Outside of an

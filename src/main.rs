@@ -431,6 +431,9 @@ impl State {
         // polls VR to detect the VBlank edge needs to see it fall here so
         // the next VBlank's rising edge is observable.
         self.bus.vdp.clear_vblank_flag();
+        // Keep the VDP's beam-phase counter (drives S2's HR bit) in step
+        // with the T-state clock we just reset.
+        self.bus.vdp.reset_scanline_phase();
 
         // Cycle-accurate(-ish) line interrupts: we step the CPU one
         // instruction at a time and re-check the current scanline
@@ -456,10 +459,16 @@ impl State {
             while last_line < target {
                 last_line += 1;
                 self.bus.vdp.snapshot_scanline(last_line as usize);
-                if self.bus.vdp.line_irq_target(last_line as u8)
-                    && self.bus.vdp.regs[0] & 0x10 != 0
-                {
+                // Per fMSX (MSX.c line-coincidence): FH (S1 bit 0) is set on
+                // EVERY coincidence — only the IRQ is gated on IE1. Games
+                // without IE1 poll S1 for the match (Space Manbow does this
+                // for its scroll split); gating FH on IE1 starved that poll
+                // loop forever. Off-coincidence with IE1 disabled, FH drops
+                // again immediately, so the poll sees a one-scanline pulse.
+                if self.bus.vdp.line_irq_target(last_line as u8) {
                     self.bus.vdp.fire_line_irq();
+                } else if self.bus.vdp.regs[0] & 0x10 == 0 {
+                    self.bus.vdp.clear_line_irq_flag();
                 }
             }
 
@@ -493,6 +502,13 @@ impl State {
         // interrupt handler runs at least once per call.
         if !vblank_fired {
             self.bus.vdp.start_vblank();
+        }
+
+        // Hang-hunting aid: MSX_PCTRACE=1 prints one PC sample per frame.
+        // A wedged game shows up as the same handful of addresses repeating;
+        // map those against the ROM/mapper banks to find the poll loop.
+        if std::env::var_os("MSX_PCTRACE").is_some() {
+            eprintln!("[pc] {:04X}", self.cpu.get_pc());
         }
     }
 
