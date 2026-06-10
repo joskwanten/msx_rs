@@ -176,6 +176,65 @@ async fn load_cartridge_rom() -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Web variant of `load_machine_roms`: `?bios=nms8245` (or `?bios=<dir>`)
+/// fetches `MSX2.ROM` + `MSX2EXT.ROM` over HTTP, relative to the page —
+/// same convention as `?rom=` for cartridges. Any failure (missing param,
+/// 404, wrong size) falls back to the embedded C-BIOS with a console
+/// warning, so a broken URL never blanks the page.
+#[cfg(target_arch = "wasm32")]
+async fn load_machine_roms() -> bus::MachineRoms {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+
+    async fn fetch_bytes(path: &str) -> Option<Vec<u8>> {
+        let win = web_sys::window()?;
+        let response: web_sys::Response = JsFuture::from(win.fetch_with_str(path))
+            .await
+            .ok()?
+            .dyn_into()
+            .ok()?;
+        if !response.ok() {
+            return None;
+        }
+        let buffer: js_sys::ArrayBuffer =
+            JsFuture::from(response.array_buffer().ok()?).await.ok()?.dyn_into().ok()?;
+        Some(js_sys::Uint8Array::new(&buffer).to_vec())
+    }
+
+    let Some(choice) = web_sys::window()
+        .and_then(|w| w.location().href().ok())
+        .and_then(|href| web_sys::Url::new(&href).ok())
+        .and_then(|url| url.search_params().get("bios"))
+    else {
+        return bus::MachineRoms::CBios;
+    };
+    let dir = if choice == "nms8245" {
+        "assets/NMS8245".to_string()
+    } else {
+        choice
+    };
+    let main = fetch_bytes(&format!("{}/MSX2.ROM", dir)).await;
+    let ext = fetch_bytes(&format!("{}/MSX2EXT.ROM", dir)).await;
+    match (main, ext) {
+        (Some(main), Some(ext)) if main.len() == 0x8000 && ext.len() == 0x4000 => {
+            web_sys::console::log_1(
+                &format!("[msx_rs] bios: NMS-8245 ROMs from {}", dir).into(),
+            );
+            bus::MachineRoms::Nms8245 { main, ext }
+        }
+        _ => {
+            web_sys::console::warn_1(
+                &format!(
+                    "[msx_rs] bios: could not load NMS-8245 ROMs from {}, falling back to C-BIOS",
+                    dir
+                )
+                .into(),
+            );
+            bus::MachineRoms::CBios
+        }
+    }
+}
+
 /// Initial post-process shader, selected by `?shader=sharp|crt` on the web
 /// or `--shader sharp|crt` on the command line. Defaults to `Sharp`.
 #[cfg(not(target_arch = "wasm32"))]
@@ -397,12 +456,12 @@ impl State {
         eprintln!("shader: {}", shader_mode.label());
 
         let audio = Audio::new();
-        // System ROM choice: env-selected NMS-8245 set on native, always
-        // C-BIOS on web (no filesystem there).
+        // System ROM choice: `MSX_BIOS=nms8245` env var on native,
+        // `?bios=nms8245` query parameter on web; C-BIOS otherwise.
         #[cfg(not(target_arch = "wasm32"))]
         let machine = load_machine_roms();
         #[cfg(target_arch = "wasm32")]
-        let machine = bus::MachineRoms::CBios;
+        let machine = load_machine_roms().await;
 
         let bus = Bus::new(
             vdp,
