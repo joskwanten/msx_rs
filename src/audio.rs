@@ -22,6 +22,7 @@
 //! unconditionally) keeps working.
 
 use crate::scc::Scc;
+use crate::ym2413::Ym2413;
 use psg::PSG;
 use std::sync::{Arc, Mutex};
 
@@ -34,9 +35,40 @@ use std::sync::{Arc, Mutex};
 /// envelope step rate match too. If SFX sound off-pitch, try doubling this.
 const MSX_PSG_CLOCK: f64 = 1_789_772.5;
 
+/// YM2413 native sample rate: master clock / 72 (3.579545 MHz / 72).
+/// The mixer steps the chip with a fractional accumulator and holds the
+/// last sample (zero-order hold) to bridge to the device rate — fine for
+/// a chip whose output is already a 49.7 kHz staircase.
+const YM2413_RATE: f64 = 3_579_545.0 / 72.0;
+
+/// Per-device-sample stepper for the FM chip: how many chip samples to
+/// generate before emitting the next output sample.
+struct FmResampler {
+    step: f64,
+    acc: f64,
+    last: f32,
+}
+
+impl FmResampler {
+    fn new(device_rate: f64) -> Self {
+        Self { step: YM2413_RATE / device_rate, acc: 0.0, last: 0.0 }
+    }
+
+    fn next(&mut self, chip: &mut Ym2413) -> f32 {
+        self.acc += self.step;
+        while self.acc >= 1.0 {
+            self.acc -= 1.0;
+            // Chip output peaks around ±12000; scale into f32 audio range.
+            self.last = chip.sample() as f32 / 16384.0;
+        }
+        self.last
+    }
+}
+
 pub struct Audio {
     pub psg: Arc<Mutex<PSG>>,
     pub scc: Arc<Mutex<Scc>>,
+    pub ym2413: Arc<Mutex<Ym2413>>,
     /// The cpal stream itself on native. Holding it keeps audio alive;
     /// dropping it stops playback. We never touch it again after construction.
     #[cfg(not(target_arch = "wasm32"))]
@@ -80,8 +112,12 @@ impl Audio {
         let psg = Arc::new(Mutex::new(psg_inner));
         let scc = Arc::new(Mutex::new(Scc::new(sample_rate as f32)));
 
+        let ym2413 = Arc::new(Mutex::new(Ym2413::new()));
+
         let psg_audio = Arc::clone(&psg);
         let scc_audio = Arc::clone(&scc);
+        let ym_audio = Arc::clone(&ym2413);
+        let mut fm_resampler = FmResampler::new(sample_rate as f64);
 
         let stream = device
             .build_output_stream(
@@ -89,6 +125,7 @@ impl Audio {
                 move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
                     let mut psg = psg_audio.lock().unwrap();
                     let mut scc = scc_audio.lock().unwrap();
+                    let mut ym = ym_audio.lock().unwrap();
 
                     for frame in data.chunks_mut(channels) {
                         let (psg_l, psg_r) = psg.render();
@@ -97,7 +134,9 @@ impl Audio {
                         // both chips peak around 1.0, so we attenuate to keep
                         // headroom and avoid clipping when both are loud.
                         let psg_mono = ((psg_l + psg_r) * 0.5) as f32;
-                        let mix = psg_mono * 0.6 + scc.next_sample() * 0.6;
+                        let mix = psg_mono * 0.6
+                            + scc.next_sample() * 0.6
+                            + fm_resampler.next(&mut ym) * 0.9;
 
                         for out in frame.iter_mut() {
                             *out = mix;
@@ -114,6 +153,7 @@ impl Audio {
         Self {
             psg,
             scc,
+            ym2413,
             _stream: stream,
         }
     }
@@ -156,20 +196,27 @@ impl Audio {
             .create_script_processor_with_buffer_size_and_number_of_input_channels_and_number_of_output_channels(512, 0, 1)
             .expect("failed to create ScriptProcessorNode");
 
+        let ym2413 = Arc::new(Mutex::new(Ym2413::new()));
+
         let psg_cb = Arc::clone(&psg);
         let scc_cb = Arc::clone(&scc);
+        let ym_cb = Arc::clone(&ym2413);
+        let mut fm_resampler = FmResampler::new(sample_rate as f64);
         let callback = Closure::wrap(Box::new(move |event: web_sys::AudioProcessingEvent| {
             let output = event.output_buffer().expect("no output buffer");
             let n = output.length() as usize;
 
             let mut psg = psg_cb.lock().unwrap();
             let mut scc = scc_cb.lock().unwrap();
+            let mut ym = ym_cb.lock().unwrap();
 
             let mut buf = vec![0.0f32; n];
             for sample in buf.iter_mut() {
                 let (psg_l, psg_r) = psg.render();
                 let psg_mono = ((psg_l + psg_r) * 0.5) as f32;
-                *sample = psg_mono * 0.6 + scc.next_sample() * 0.6;
+                *sample = psg_mono * 0.6
+                    + scc.next_sample() * 0.6
+                    + fm_resampler.next(&mut ym) * 0.9;
             }
 
             let _ = output.copy_to_channel(&buf, 0);
@@ -183,6 +230,7 @@ impl Audio {
         Self {
             psg,
             scc,
+            ym2413,
             web: WebAudio {
                 context,
                 _processor: processor,

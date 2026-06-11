@@ -1356,6 +1356,14 @@ impl Vdp {
         (self.regs[0] & 0x0C) != 0
     }
 
+    /// True when R9's NT bit (bit 1) selects PAL — 50 Hz, 313 scanlines
+    /// per frame. European BIOSes (the NMS-8245!) set this at boot; the
+    /// frame loop reads it to pick the matching frame length and pacing,
+    /// so PAL games run at their intended speed instead of ~20% fast.
+    pub fn is_pal(&self) -> bool {
+        self.regs[9] & 0x02 != 0
+    }
+
     fn write_control(&mut self, value: u8) {
         if !self.has_latched_data {
             self.latched_data = value;

@@ -18,11 +18,14 @@
 use crate::ppi::Ppi;
 use crate::rtc::Rtc;
 use crate::scc::Scc;
+use crate::fdc::{DiskImage, Wd2793};
 use crate::slot::{
-    detect_mapper, Ascii16Cartridge, Ascii8Cartridge, CartridgeMapper, KonamiMegaRomCartridge,
-    KonamiMegaRomSccCartridge, MappedRamSlot, RomSlot, Slot, Slots, SubslottedSlot,
+    detect_mapper, Ascii16Cartridge, Ascii8Cartridge, CartridgeMapper, DiskRomSlot,
+    KonamiMegaRomCartridge, KonamiMegaRomSccCartridge, MappedRamSlot, RomSlot, Slot, Slots,
+    SubslottedSlot,
 };
 use crate::vdp::Vdp;
+use crate::ym2413::Ym2413;
 use psg::PSG;
 use std::num::NonZeroU16;
 use std::sync::{Arc, Mutex};
@@ -33,7 +36,18 @@ use std::sync::{Arc, Mutex};
 /// main.rs).
 pub enum MachineRoms {
     CBios,
-    Nms8245 { main: Vec<u8>, ext: Vec<u8> },
+    Nms8245 {
+        main: Vec<u8>,
+        ext: Vec<u8>,
+        /// DISK.ROM — mounted in 3-3 with the WD2793 when present.
+        disk: Option<Vec<u8>>,
+        /// Raw .DSK image for drive A (`--disk` / `?disk=`).
+        disk_image: Option<Vec<u8>>,
+        /// FM-PAC ROM (first 16 KiB bank) — mounted in cartridge slot 2
+        /// so games find the "PAC2OPLL" id at 0x4018 and enable their
+        /// FM soundtracks. The YM2413 itself lives on ports 0x7C/0x7D.
+        fmpac: Option<Vec<u8>>,
+    },
 }
 
 /// Transparently unpack a zipped ROM. ROM collections ship one zip per
@@ -142,6 +156,13 @@ const CBIOS_SUB: &[u8] = include_bytes!("../assets/cbios_sub.rom");
 /// 2 → 3 for "AB" headers: a game in slot 1 wins, otherwise BASIC fires.
 const CBIOS_BASIC: &[u8] = include_bytes!("../assets/cbios_basic.rom");
 
+/// C-BIOS MSX-MUSIC ROM — 16 KiB, embedded at compile time. Carries the
+/// "APRLOPLL" id at 0x4018 that games scan for before enabling their FM
+/// soundtracks, plus an open-source FM-BIOS. Mounted in slot 2 of the
+/// NMS-8245 machine as the default MSX-MUSIC; a real FM-PAC dump in
+/// assets/fmpac.rom takes precedence when present.
+const CBIOS_MUSIC: &[u8] = include_bytes!("../assets/cbios_music.rom");
+
 /// MSX-level memory abstraction. Mirrors your TypeScript
 /// `Memory { uread8, uwrite8 }` — minus the unsigned hint, since Rust's
 /// `u8` is already unsigned.
@@ -173,6 +194,9 @@ pub struct Bus {
     /// keeps its boot settings in the chip's CMOS banks — see rtc.rs.
     rtc: Rtc,
     psg: Arc<Mutex<PSG>>,
+    /// YM2413 (MSX-MUSIC / FM-PAC) on I/O ports 0x7C/0x7D. Shared with
+    /// the audio thread like the PSG and SCC.
+    ym2413: Arc<Mutex<Ym2413>>,
     /// Last value written to port 0xA0 — selects which of the PSG's 14
     /// registers the next 0xA1 write or 0xA2 read targets.
     psg_reg_select: u8,
@@ -186,6 +210,7 @@ impl Bus {
     pub fn new(
         vdp: Vdp,
         psg: Arc<Mutex<PSG>>,
+        ym2413: Arc<Mutex<Ym2413>>,
         scc: Arc<Mutex<Scc>>,
         cartridge_rom: Option<Vec<u8>>,
         machine: MachineRoms,
@@ -245,19 +270,35 @@ impl Bus {
             //                   memory-mapped registers we don't emulate, and
             //                   open-bus 0xFF reads as "forever busy", which
             //                   wedges the boot. Mount it when an FDC lands.
-            MachineRoms::Nms8245 { main, ext } => {
+            MachineRoms::Nms8245 { main, ext, disk, disk_image, fmpac } => {
                 let bios = RomSlot::new(main.into_boxed_slice(), 0x0000);
                 let sub_rom = RomSlot::new(ext.into_boxed_slice(), 0x0000);
+                // 3-3: the Philips disk interface — DISK.ROM with the
+                // WD2793 overlaid at 0x7FF8-0x7FFF (see slot.rs/fdc.rs).
+                // The drive boots empty unless a .DSK image was supplied.
+                let disk_slot = match disk {
+                    Some(rom) => Slot::DiskRom(DiskRomSlot::new(
+                        rom.into_boxed_slice(),
+                        Wd2793::new(disk_image.map(DiskImage::new)),
+                    )),
+                    None => Slot::Empty,
+                };
                 let slot3 = SubslottedSlot::new([
                     Slot::Rom(sub_rom),                    // 3-0 ← MSX2EXT.ROM
                     Slot::Empty,                           // 3-1
                     Slot::MappedRam(MappedRamSlot::new()), // 3-2 ← RAM mapper
-                    Slot::Empty,                           // 3-3 (disk, see above)
+                    disk_slot,                             // 3-3 ← DISK.ROM + FDC
                 ]);
+                // Slot 2: MSX-MUSIC. The OPLL id string at 0x4018 is what
+                // makes games turn their FM music on; a user-supplied
+                // FM-PAC dump wins, the embedded open-source C-BIOS music
+                // ROM (APRLOPLL id, no init vector) is the default.
+                let fm_rom = fmpac.unwrap_or_else(|| CBIOS_MUSIC.to_vec());
+                let slot2 = Slot::Rom(RomSlot::new(fm_rom.into_boxed_slice(), 0x4000));
                 Slots::new([
                     Slot::Rom(bios),
                     cartridge_slot,
-                    Slot::Empty,
+                    slot2,
                     Slot::Subslotted(Box::new(slot3)),
                 ])
             }
@@ -268,6 +309,7 @@ impl Bus {
             ppi: Ppi::new(),
             rtc: Rtc::new(),
             psg,
+            ym2413,
             psg_reg_select: 0,
             forced_mapper,
         }
@@ -347,6 +389,13 @@ impl Io for Bus {
                 .unwrap()
                 .set_register(self.psg_reg_select, value),
             0xA8 => self.slots.slot_register = value,
+            // YM2413 / MSX-MUSIC: FM register select + data. Sound
+            // drivers bang these after detecting an OPLL ROM id.
+            0x7C => self.ym2413.lock().unwrap().write(0, value),
+            0x7D => {
+                crate::mlog!(FM, "reg write {:02X}", value);
+                self.ym2413.lock().unwrap().write(1, value);
+            }
             // RP-5C01 real-time clock: register select + data.
             0xB4 => self.rtc.select(value),
             0xB5 => self.rtc.write(value),

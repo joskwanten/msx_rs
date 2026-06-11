@@ -19,6 +19,7 @@
 #![allow(dead_code)] // WIP module — some variants (Rom) wait for BIOS data.
 
 use crate::bus::Memory;
+use crate::fdc::Wd2793;
 use crate::scc::Scc;
 use std::sync::{Arc, Mutex};
 
@@ -50,6 +51,10 @@ pub enum Slot {
     Ascii8Cartridge(Ascii8Cartridge),
     /// ASCII 16 KiB mega-ROM (Hydlide, many ASCII/HAL/Sony titles).
     Ascii16Cartridge(Ascii16Cartridge),
+    /// Philips disk interface: DISK.ROM at 0x4000 with the WD2793's
+    /// registers memory-mapped over its top 8 bytes (0x7FF8-0x7FFF).
+    /// Lives in subslot 3-3 on the NMS-8245.
+    DiskRom(DiskRomSlot),
 }
 
 impl Memory for Slot {
@@ -64,6 +69,10 @@ impl Memory for Slot {
             Slot::KonamiMegaRomCartridge(c) => c.read8(addr),
             Slot::Ascii8Cartridge(c) => c.read8(addr),
             Slot::Ascii16Cartridge(c) => c.read8(addr),
+            // The FDC has read side effects (data register pops a byte,
+            // status clears INTRQ) but `Memory::read8` takes `&self` —
+            // interior mutability via RefCell keeps the trait intact.
+            Slot::DiskRom(d) => d.read8(addr),
         }
     }
 
@@ -78,6 +87,7 @@ impl Memory for Slot {
             Slot::KonamiMegaRomCartridge(c) => c.write8(addr, value),
             Slot::Ascii8Cartridge(c) => c.write8(addr, value),
             Slot::Ascii16Cartridge(c) => c.write8(addr, value),
+            Slot::DiskRom(d) => d.write8(addr, value),
         }
     }
 }
@@ -643,6 +653,45 @@ impl Memory for Ascii16Cartridge {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// Philips disk interface for subslot 3-3: 16 KiB DISK.ROM mapped at
+/// 0x4000-0x7FFF with the WD2793's registers overlaid on the top eight
+/// bytes (0x7FF8-0x7FFF). The driver inside DISK.ROM talks to the chip
+/// purely through those addresses.
+///
+/// The FDC sits in a `RefCell` because reads have side effects (the data
+/// register pops a transfer byte; reading status clears INTRQ) while the
+/// `Memory` trait's `read8` takes `&self`. Single-threaded emulator core,
+/// so `RefCell` is safe and cheap.
+pub struct DiskRomSlot {
+    rom: Box<[u8]>,
+    fdc: std::cell::RefCell<Wd2793>,
+}
+
+impl DiskRomSlot {
+    pub fn new(rom: Box<[u8]>, fdc: Wd2793) -> Self {
+        Self {
+            rom,
+            fdc: std::cell::RefCell::new(fdc),
+        }
+    }
+}
+
+impl Memory for DiskRomSlot {
+    fn read8(&self, addr: u16) -> u8 {
+        match addr {
+            0x7FF8..=0x7FFF => self.fdc.borrow_mut().read(addr),
+            0x4000..=0x7FF7 => self.rom[(addr - 0x4000) as usize],
+            _ => 0xFF,
+        }
+    }
+
+    fn write8(&mut self, addr: u16, value: u8) {
+        if let 0x7FF8..=0x7FFF = addr {
+            self.fdc.get_mut().write(addr, value);
         }
     }
 }

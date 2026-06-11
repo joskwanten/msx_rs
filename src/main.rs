@@ -1,5 +1,6 @@
 mod audio;
 mod bus;
+mod fdc;
 mod log;
 mod post;
 mod ppi;
@@ -7,6 +8,7 @@ mod rtc;
 mod scc;
 mod slot;
 mod vdp;
+mod ym2413;
 
 use audio::Audio;
 use bus::Bus;
@@ -36,6 +38,12 @@ use z80emu::{host::TsCounter, Cpu, Z80NMOS};
 /// VBLANK and let the game's interrupt handler run.
 const FRAME_TSTATES: i32 = 59_659;
 
+/// T-states per emulated frame at PAL (3.579545 MHz / 50 Hz). Selected
+/// per frame by R9's NT bit — see `Vdp::is_pal`. Same convention as the
+/// NTSC value: clock / refresh rate, not lines × 228 (which would give
+/// 50.16 Hz; we pace at an even 50 like we pace NTSC at an even 60).
+const PAL_FRAME_TSTATES: i32 = 71_591;
+
 /// Visible scan-lines per frame, sized for V9938's 212-line mode (R9
 /// bit 7 = LN). MSX1 software (and MSX2 in 192-line mode) only uses the
 /// top 192 of these — but most MSX2 cartridges with a status bar (KV2,
@@ -53,10 +61,12 @@ const VISIBLE_LINES: u32 = 212;
 /// per-line palette tricks, etc.).
 const SCANLINE_TSTATES: i32 = 228;
 
-/// MSX target frame rate. We pace CPU emulation against wall-clock time so
-/// the emulator runs at the right speed regardless of host display refresh
-/// (30 Hz, 60 Hz, 144 Hz, whatever).
-const MSX_HZ: f64 = 60.0;
+/// MSX target frame rates. We pace CPU emulation against wall-clock time
+/// so the emulator runs at the right speed regardless of host display
+/// refresh (30 Hz, 60 Hz, 144 Hz, whatever). Which of the two applies is
+/// decided per frame by the VDP's R9 NT bit.
+const MSX_HZ_NTSC: f64 = 60.0;
+const MSX_HZ_PAL: f64 = 50.0;
 
 /// Maximum wall-clock seconds we'll try to catch up after a stall (e.g. the
 /// window was dragged or backgrounded). Anything longer is discarded — better
@@ -76,7 +86,7 @@ fn load_cartridge_rom() -> Option<Vec<u8>> {
     let mut args = std::env::args().skip(1);
     let path = loop {
         let arg = args.next()?;
-        if arg == "--shader" || arg == "--mapper" {
+        if arg == "--shader" || arg == "--mapper" || arg == "--disk" {
             let _ = args.next(); // skip the flag's value
             continue;
         }
@@ -140,6 +150,32 @@ fn forced_mapper() -> Option<slot::CartridgeMapper> {
     }
 }
 
+/// `--disk <path.dsk>` — raw 360/720 KiB sector image for drive A.
+/// Zipped images unpack transparently (same PK sniffing as cartridges).
+#[cfg(not(target_arch = "wasm32"))]
+fn load_disk_image() -> Option<Vec<u8>> {
+    let mut args = std::env::args().skip(1);
+    let mut path = None;
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--disk=") {
+            path = Some(value.to_string());
+        } else if arg == "--disk" {
+            path = args.next();
+        }
+    }
+    let path = path?;
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            eprintln!("disk: {} ({} bytes)", path, bytes.len());
+            Some(bytes)
+        }
+        Err(e) => {
+            eprintln!("disk: could not read {}: {} — drive A boots empty", path, e);
+            None
+        }
+    }
+}
+
 /// Pick the system ROM set. `MSX_BIOS=nms8245` (or a path to a directory
 /// holding `MSX2.ROM` + `MSX2EXT.ROM`) boots the real Philips NMS-8245
 /// BIOS; anything else — including unset — boots the embedded C-BIOS.
@@ -160,7 +196,31 @@ fn load_machine_roms() -> bus::MachineRoms {
     match (main, ext) {
         (Ok(main), Ok(ext)) if main.len() == 0x8000 && ext.len() == 0x4000 => {
             eprintln!("bios: NMS-8245 ROMs from {}", dir.display());
-            bus::MachineRoms::Nms8245 { main, ext }
+            // DISK.ROM is optional — without it the machine boots
+            // diskless, exactly like an 8245 with a detached drive.
+            let disk = std::fs::read(dir.join("DISK.ROM"))
+                .ok()
+                .filter(|d| d.len() == 0x4000);
+            if disk.is_some() {
+                eprintln!("bios: DISK.ROM mounted (WD2793 in 3-3)");
+            }
+            let disk_image = load_disk_image();
+            // Optional override: a real FM-PAC dump beats the embedded
+            // C-BIOS music ROM that bus.rs mounts in slot 2 when this is
+            // None. Only needed for software that calls the original
+            // Panasonic FM-BIOS routines or uses PAC saves — MSX-MUSIC
+            // detection and FM playback work with the embedded ROM.
+            // Dumps are 16 KiB or 64 KiB (banked); the id + FM-BIOS live
+            // in the first 16 KiB, which is all our flat mount needs.
+            let fmpac = std::fs::read("assets/fmpac.rom")
+                .ok()
+                .map(|mut r| { r.truncate(0x4000); r })
+                .filter(|r| r.len() == 0x4000);
+            match &fmpac {
+                Some(_) => eprintln!("fm: FM-PAC ROM from assets/fmpac.rom in slot 2"),
+                None => eprintln!("fm: embedded C-BIOS music ROM in slot 2"),
+            }
+            bus::MachineRoms::Nms8245 { main, ext, disk, disk_image, fmpac }
         }
         (Ok(m), Ok(e)) => {
             eprintln!(
@@ -260,7 +320,23 @@ async fn load_machine_roms() -> bus::MachineRoms {
             web_sys::console::log_1(
                 &format!("[msx_rs] bios: NMS-8245 ROMs from {}", dir).into(),
             );
-            bus::MachineRoms::Nms8245 { main, ext }
+            let disk = fetch_bytes(&format!("{}/DISK.ROM", dir))
+                .await
+                .filter(|d| d.len() == 0x4000);
+            let fmpac = fetch_bytes("assets/fmpac.rom")
+                .await
+                .map(|mut r| { r.truncate(0x4000); r })
+                .filter(|r| r.len() == 0x4000);
+            // `?disk=<path.dsk>` — drive A image, fetched like `?rom=`.
+            let disk_image = match web_sys::window()
+                .and_then(|w| w.location().href().ok())
+                .and_then(|href| web_sys::Url::new(&href).ok())
+                .and_then(|url| url.search_params().get("disk"))
+            {
+                Some(path) => fetch_bytes(&path).await,
+                None => None,
+            };
+            bus::MachineRoms::Nms8245 { main, ext, disk, disk_image, fmpac }
         }
         _ => {
             web_sys::console::warn_1(
@@ -506,6 +582,7 @@ impl State {
         let bus = Bus::new(
             vdp,
             Arc::clone(&audio.psg),
+            Arc::clone(&audio.ym2413),
             Arc::clone(&audio.scc),
             cartridge_rom,
             machine,
@@ -606,7 +683,16 @@ impl State {
         let mut last_line: i32 = -1;
         let mut vblank_fired = false;
 
-        while self.clock.0.0 < FRAME_TSTATES {
+        // Frame length follows the VDP's video standard: PAL frames carry
+        // ~50 extra border/vblank scanlines, so a 50 Hz game gets the same
+        // CPU budget per second as on real hardware. Sampled once per
+        // frame — R9 writes mid-frame take effect on the next one.
+        let frame_tstates = if self.bus.vdp.is_pal() {
+            PAL_FRAME_TSTATES
+        } else {
+            FRAME_TSTATES
+        };
+        while self.clock.0.0 < frame_tstates {
             let current_line = self.clock.0.0 / SCANLINE_TSTATES;
 
             // Walk last_line up to current_line (capped at the last
@@ -715,7 +801,12 @@ impl State {
             .min(MAX_CATCHUP_SECS);
         self.last_step = now;
 
-        self.msx_frame_accumulator += elapsed * MSX_HZ;
+        let msx_hz = if self.bus.vdp.is_pal() {
+            MSX_HZ_PAL
+        } else {
+            MSX_HZ_NTSC
+        };
+        self.msx_frame_accumulator += elapsed * msx_hz;
 
         // Step AT MOST one emulated frame per call. The render pass that
         // follows presents whatever VRAM this frame produced; if we stepped
@@ -1087,7 +1178,8 @@ impl ApplicationHandler for App {
         // Schedule the next wake-up one MSX frame from now. When the window
         // is visible, vsync paces us anyway; when hidden, this keeps the loop
         // from busy-spinning while still feeding the audio thread.
-        let next = Instant::now() + Duration::from_secs_f64(1.0 / MSX_HZ);
+        let hz = if state.bus.vdp.is_pal() { MSX_HZ_PAL } else { MSX_HZ_NTSC };
+        let next = Instant::now() + Duration::from_secs_f64(1.0 / hz);
         event_loop.set_control_flow(ControlFlow::WaitUntil(next));
     }
 }
