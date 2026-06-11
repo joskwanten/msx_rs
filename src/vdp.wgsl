@@ -36,8 +36,10 @@
 
 struct Uniforms {
     framebuffer_size: vec2<f32>,
-    // Alignment padding so `regs` starts on a 16-byte boundary.
-    _pad: vec2<u32>,
+    // flags bit 0: linearize shader-computed direct colours (G7) —
+    // set on native sRGB surfaces, clear on web Unorm surfaces.
+    flags: u32,
+    _pad: u32,
     regs: array<vec4<u32>, 6>,      // R0-R23 (one byte per u32 lane)
     // Per-visible-scanline snapshots of R5 / R6 / R11 / R23, packed:
     //   bits 0..7  = R5
@@ -508,7 +510,28 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         color_idx = shade_g3(px, py);
     } else if (m5 == 1u && m4 == 0u && m3 == 0u && m2 == 0u && m1 == 0u) {
         // G5 / Screen 6 — 512×212 2bpp; the MSX2 BIOS boot logo lives here.
-        color_idx = shade_g5(px, py);
+        // Sprites first (they live in 256-wide coordinates), then blend the
+        // background pixel pair down to our 256-wide canvas.
+        let sprite = sample_sprite_mode2(px, py);
+        if (sprite < 16u) { return u.palette[sprite]; }
+        let even = u.palette[shade_g5(px << 1u, py)];
+        let odd = u.palette[shade_g5((px << 1u) | 1u, py)];
+        return vec4<f32>(((even + odd) * 0.5).rgb, 1.0);
+    } else if (m5 == 1u && m4 == 0u && m3 == 1u && m2 == 0u && m1 == 0u) {
+        // G6 / Screen 7 — 512×212 4bpp (Hydlide 3 in-game). Same pair-blend.
+        let sprite = sample_sprite_mode2(px, py);
+        if (sprite < 16u) { return u.palette[sprite]; }
+        let even = u.palette[shade_g6(px << 1u, py)];
+        let odd = u.palette[shade_g6((px << 1u) | 1u, py)];
+        return vec4<f32>(((even + odd) * 0.5).rgb, 1.0);
+    } else if (m5 == 1u && m4 == 1u && m3 == 1u && m2 == 0u && m1 == 0u) {
+        // G7 / Screen 8 — 256×212 direct colour (Aleste's title screen).
+        // Sprites still come from the programmable palette; real hardware
+        // uses a fixed 16-colour sprite table here — close enough until a
+        // game visibly disagrees.
+        let sprite = sample_sprite_mode2(px, py);
+        if (sprite < 16u) { return u.palette[sprite]; }
+        return shade_g7(px, py);
     } else if (m4 == 1u || m5 == 1u) {
         color_idx = backdrop();        // other V9938 modes not yet implemented
     } else if (m3 == 1u) {
@@ -782,17 +805,69 @@ fn shade_g3(px: u32, py: u32) -> u32 {
 //   page 2 base = 0x10000
 //   page 3 base = 0x18000
 //
+// One sRGB channel → linear light, for colours computed inside the shader
+// (G7 direct colour). The palette path never needs this — entries arrive
+// pre-converted from the CPU side.
+fn srgb_to_linear(c: f32) -> f32 {
+    if (c <= 0.04045) {
+        return c / 12.92;
+    }
+    return pow((c + 0.055) / 1.055, 2.4);
+}
+
+// G7 (SCREEN 8): 256×212 bitmap, one byte per pixel, DIRECT colour —
+// no palette. Byte layout GGGRRRBB: green in bits 7:5, red in 4:2, blue
+// in 1:0 (blue gets only 2 bits). 256 bytes per row → 64 KiB pages,
+// selected by R2 bit 5 like G6. Returns the final RGBA, honouring the
+// uniform's linearize flag (sRGB surface on native, Unorm on web).
+fn shade_g7(px: u32, py: u32) -> vec4<f32> {
+    let page = (line_r2(py) >> 5u) & 1u;
+    let page_base = page << 16u;
+    let bitmap_y = (py + line_r23(py)) & 0xFFu;
+    let byte = vram_byte(page_base + bitmap_y * 256u + px);
+    var r = f32((byte >> 2u) & 0x07u) / 7.0;
+    var g = f32((byte >> 5u) & 0x07u) / 7.0;
+    var b = f32(byte & 0x03u) / 3.0;
+    if ((u.flags & 1u) != 0u) {
+        r = srgb_to_linear(r);
+        g = srgb_to_linear(g);
+        b = srgb_to_linear(b);
+    }
+    return vec4<f32>(r, g, b, 1.0);
+}
+
+// G6 (SCREEN 7): 512×212 bitmap, 4 bits per pixel, 2 pixels per byte,
+// 256 bytes per row → a page is 64 KiB, so 128 KiB VRAM holds two pages
+// selected by R2 bit 5. Takes a TRUE 512-space x; the caller blends the
+// even/odd pair down to the 256-wide canvas. Hydlide 3 runs its entire
+// in-game screen (and its load/save text) here.
+fn shade_g6(x: u32, py: u32) -> u32 {
+    let page = (line_r2(py) >> 5u) & 1u;
+    let page_base = page << 16u;
+    let bitmap_y = (py + line_r23(py)) & 0xFFu;
+    let byte_addr = page_base + bitmap_y * 256u + (x >> 1u);
+    let byte = vram_byte(byte_addr);
+    // Even pixel in the high nibble, odd in the low.
+    let shift = (1u - (x & 1u)) * 4u;
+    var bg = (byte >> shift) & 0x0Fu;
+
+    // Colour-0 transparency, same TP rule as G4/G5.
+    if (bg == 0u && (line_r8(py) & 0x20u) == 0u) {
+        bg = line_r7(py) & 0x0Fu;
+    }
+    return bg;
+}
+
 // G5 (SCREEN 6): 512×212 bitmap, 2 bits per pixel, 4 pixels per byte,
 // 128 bytes per row. Same page/scroll structure as G4 (32 KiB pages via
-// R2 bits 5-6, rows wrap mod 256). Our canvas is 256 wide, so each output
-// pixel samples the even source pixel of its 2-pixel pair — crisp enough
-// for the line art this mode typically carries (the MSX2 BIOS draws its
-// boot logo here with LINE/PSET/LMMC commands).
-fn shade_g5(px: u32, py: u32) -> u32 {
+// R2 bits 5-6, rows wrap mod 256). Takes a TRUE 512-space x; the caller
+// blends pixel pairs down to the 256-wide canvas — text drawn with
+// single-pixel strokes (the whole point of 512-wide modes) survives the
+// halving as anti-aliasing instead of losing every odd column.
+fn shade_g5(x: u32, py: u32) -> u32 {
     let page = (line_r2(py) >> 5u) & 3u;
     let page_base = page << 15u;
     let bitmap_y = (py + line_r23(py)) & 0xFFu;
-    let x = px << 1u; // even pixel of the 512-wide pair
     let byte_addr = page_base + bitmap_y * 128u + (x >> 2u);
     let byte = vram_byte(byte_addr);
     // Leftmost pixel lives in bits 7:6.
@@ -805,9 +880,6 @@ fn shade_g5(px: u32, py: u32) -> u32 {
     if (bg == 0u && (line_r8(py) & 0x20u) == 0u) {
         bg = line_r7(py) & 0x03u;
     }
-
-    let sprite = sample_sprite_mode2(px, py);
-    if (sprite < 16u) { return sprite; }
     return bg;
 }
 

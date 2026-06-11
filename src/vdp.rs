@@ -50,8 +50,14 @@ fn srgb_to_linear(c: f32) -> f32 {
 struct Uniforms {
     framebuffer_size: [f32; 2],
     // Alignment padding so the following vec4<u32> register block starts on a
-    // 16-byte boundary. Reserved for future shader flags.
-    _pad: [u32; 2],
+    // 16-byte boundary.
+    //   flags bit 0: convert shader-computed direct colours (G7) from
+    //   sRGB to linear — set on native (sRGB surface does the inverse
+    //   on write), clear on web (Unorm surface wants raw sRGB). The
+    //   16-entry palette is pre-converted CPU-side; only colours born
+    //   inside the shader need this.
+    flags: u32,
+    _pad: u32,
     // R0-R23 in 6 vec4<u32> chunks. R8-R23 are V9938-only control regs
     // (mode bits, palette pointer, command engine setup), used by the
     // wider-mask V9938 shading paths. Command-engine regs R32-R46 stay on
@@ -454,7 +460,11 @@ impl Vdp {
 
         let uniforms = Uniforms {
             framebuffer_size: [framebuffer_size.0 as f32, framebuffer_size.1 as f32],
-            _pad: [0, 0],
+            #[cfg(not(target_arch = "wasm32"))]
+            flags: 1,
+            #[cfg(target_arch = "wasm32")]
+            flags: 0,
+            _pad: 0,
             regs: regs_packed,
             scanline_regs: scanline_packed,
             scanline_regs2: scanline_packed2,

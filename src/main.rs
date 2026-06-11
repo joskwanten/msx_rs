@@ -76,15 +76,12 @@ fn load_cartridge_rom() -> Option<Vec<u8>> {
     let mut args = std::env::args().skip(1);
     let path = loop {
         let arg = args.next()?;
-        if arg == "--shader" {
-            let _ = args.next(); // skip the value
-            continue;
-        }
-        if arg.starts_with("--shader=") {
+        if arg == "--shader" || arg == "--mapper" {
+            let _ = args.next(); // skip the flag's value
             continue;
         }
         if arg.starts_with("--") {
-            continue;
+            continue; // covers --shader=… / --mapper=… / unknown flags
         }
         break arg;
     };
@@ -96,6 +93,49 @@ fn load_cartridge_rom() -> Option<Vec<u8>> {
         Err(e) => {
             eprintln!("failed to read cartridge ROM {}: {}", path, e);
             std::process::exit(1);
+        }
+    }
+}
+
+/// Mapper override: `--mapper <name>` / `--mapper=<name>` on the command
+/// line, `?mapper=<name>` on the web. Applies to the boot cartridge and
+/// every drag-and-drop swap in the session. Unknown names warn and fall
+/// back to auto-detection; valid names come from `CartridgeMapper::NAMES`
+/// so new mappers join automatically.
+fn forced_mapper() -> Option<slot::CartridgeMapper> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let choice: Option<String> = {
+        let mut args = std::env::args().skip(1);
+        let mut found = None;
+        while let Some(arg) = args.next() {
+            if let Some(value) = arg.strip_prefix("--mapper=") {
+                found = Some(value.to_string());
+            } else if arg == "--mapper" {
+                found = args.next();
+            }
+        }
+        found
+    };
+    #[cfg(target_arch = "wasm32")]
+    let choice: Option<String> = web_sys::window()
+        .and_then(|w| w.location().href().ok())
+        .and_then(|href| web_sys::Url::new(&href).ok())
+        .and_then(|url| url.search_params().get("mapper"));
+
+    let choice = choice?;
+    match slot::CartridgeMapper::parse(&choice) {
+        Some(mapper) => Some(mapper),
+        None => {
+            let msg = format!(
+                "unknown mapper '{}' — valid: {}; using auto-detection",
+                choice,
+                slot::CartridgeMapper::name_list()
+            );
+            #[cfg(not(target_arch = "wasm32"))]
+            eprintln!("{}", msg);
+            #[cfg(target_arch = "wasm32")]
+            web_sys::console::warn_1(&format!("[msx_rs] {}", msg).into());
+            None
         }
     }
 }
@@ -469,6 +509,7 @@ impl State {
             Arc::clone(&audio.scc),
             cartridge_rom,
             machine,
+            forced_mapper(),
         );
 
         // Default::default() on Z80NMOS gives all-zero registers — including

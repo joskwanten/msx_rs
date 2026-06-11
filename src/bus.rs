@@ -19,8 +19,8 @@ use crate::ppi::Ppi;
 use crate::rtc::Rtc;
 use crate::scc::Scc;
 use crate::slot::{
-    detect_mapper, CartridgeMapper, KonamiMegaRomCartridge, KonamiMegaRomSccCartridge,
-    MappedRamSlot, RomSlot, Slot, Slots, SubslottedSlot,
+    detect_mapper, Ascii16Cartridge, Ascii8Cartridge, CartridgeMapper, KonamiMegaRomCartridge,
+    KonamiMegaRomSccCartridge, MappedRamSlot, RomSlot, Slot, Slots, SubslottedSlot,
 };
 use crate::vdp::Vdp;
 use psg::PSG;
@@ -36,23 +36,88 @@ pub enum MachineRoms {
     Nms8245 { main: Vec<u8>, ext: Vec<u8> },
 }
 
-/// Build the slot contents for a cartridge: detect the mapper and wrap the
-/// ROM in the matching `Slot` variant, or return `Slot::Empty` when no ROM
-/// is supplied. With slot 1 empty the BIOS scan continues to slot 2 where
-/// C-BIOS BASIC is mounted, so boot falls through to a BASIC prompt. Used
-/// by both `Bus::new` and `Bus::swap_cartridge`.
-fn build_cartridge_slot(rom: Option<Vec<u8>>, scc: Arc<Mutex<Scc>>) -> Slot {
+/// Transparently unpack a zipped ROM. ROM collections ship one zip per
+/// title; when the buffer carries the PK\x03\x04 signature we extract the
+/// most plausible entry — preferring ROM-family extensions, then the
+/// largest file (skipping directories and metadata). On any zip error the
+/// original bytes pass through untouched, so a corrupt archive fails the
+/// same way a corrupt ROM would instead of panicking the loader.
+fn unzip_rom(bytes: Vec<u8>) -> Vec<u8> {
+    // Borrowing inner fn: `bytes` stays owned by the caller so every error
+    // path can fall back to returning the original buffer.
+    fn try_extract(bytes: &[u8]) -> Option<Vec<u8>> {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
+        // Pick the entry to load: (has ROM extension, size) — bool sorts
+        // false < true, so any *.rom beats any larger non-ROM file.
+        let mut best: Option<(usize, (bool, u64))> = None;
+        for i in 0..archive.len() {
+            let Ok(entry) = archive.by_index(i) else { continue };
+            if entry.is_dir() {
+                continue;
+            }
+            let name = entry.name().to_ascii_lowercase();
+            let is_rom = [".rom", ".mx1", ".mx2", ".bin"]
+                .iter()
+                .any(|ext| name.ends_with(ext));
+            let key = (is_rom, entry.size());
+            if best.is_none_or(|(_, bk)| key > bk) {
+                best = Some((i, key));
+            }
+        }
+        let (index, _) = best?;
+        let mut entry = archive.by_index(index).ok()?;
+        let mut out = Vec::with_capacity(entry.size() as usize);
+        std::io::Read::read_to_end(&mut entry, &mut out).ok()?;
+        #[cfg(not(target_arch = "wasm32"))]
+        eprintln!("unzipped: {} ({} bytes)", entry.name(), out.len());
+        Some(out)
+    }
+
+    if bytes.len() < 4 || &bytes[..4] != b"PK\x03\x04" {
+        return bytes;
+    }
+    try_extract(&bytes).unwrap_or(bytes)
+}
+
+/// Build the slot contents for a cartridge: unzip if needed, pick a mapper
+/// (user override or heuristic), and wrap the ROM in the matching `Slot`
+/// variant — or return `Slot::Empty` when no ROM is supplied. With slot 1
+/// empty the BIOS scan continues to slot 2 where C-BIOS BASIC is mounted,
+/// so boot falls through to a BASIC prompt. Used by both `Bus::new` and
+/// `Bus::swap_cartridge`.
+fn build_cartridge_slot(
+    rom: Option<Vec<u8>>,
+    scc: Arc<Mutex<Scc>>,
+    forced_mapper: Option<CartridgeMapper>,
+) -> Slot {
     match rom {
         None => Slot::Empty,
-        Some(bytes) => match detect_mapper(&bytes) {
-            CartridgeMapper::Plain => Slot::Rom(RomSlot::new(bytes.into_boxed_slice(), 0x4000)),
-            CartridgeMapper::KonamiBasic => {
-                Slot::KonamiMegaRomCartridge(KonamiMegaRomCartridge::new(bytes.into_boxed_slice()))
+        Some(bytes) => {
+            let bytes = unzip_rom(bytes);
+            // A user override (`--mapper` / `?mapper=`) beats the
+            // heuristic — the escape hatch for ROMs that bank-switch
+            // indirectly and starve the write-pattern counter (Aleste).
+            let mapper = forced_mapper.unwrap_or_else(|| detect_mapper(&bytes));
+            #[cfg(not(target_arch = "wasm32"))]
+            eprintln!("mapper: {:?}", mapper);
+            match mapper {
+                CartridgeMapper::Plain => {
+                    Slot::Rom(RomSlot::new(bytes.into_boxed_slice(), 0x4000))
+                }
+                CartridgeMapper::KonamiBasic => Slot::KonamiMegaRomCartridge(
+                    KonamiMegaRomCartridge::new(bytes.into_boxed_slice()),
+                ),
+                CartridgeMapper::KonamiSCC => Slot::KonamiMegaRomSccCartridge(
+                    KonamiMegaRomSccCartridge::new(bytes.into_boxed_slice(), Some(scc)),
+                ),
+                CartridgeMapper::Ascii8 => {
+                    Slot::Ascii8Cartridge(Ascii8Cartridge::new(bytes.into_boxed_slice()))
+                }
+                CartridgeMapper::Ascii16 => {
+                    Slot::Ascii16Cartridge(Ascii16Cartridge::new(bytes.into_boxed_slice()))
+                }
             }
-            CartridgeMapper::KonamiSCC => Slot::KonamiMegaRomSccCartridge(
-                KonamiMegaRomSccCartridge::new(bytes.into_boxed_slice(), Some(scc)),
-            ),
-        },
+        }
     }
 }
 
@@ -111,6 +176,10 @@ pub struct Bus {
     /// Last value written to port 0xA0 — selects which of the PSG's 14
     /// registers the next 0xA1 write or 0xA2 read targets.
     psg_reg_select: u8,
+    /// `--mapper` / `?mapper=` override, applied to the boot cartridge and
+    /// every drag-and-drop swap for the rest of the session. `None` = use
+    /// `detect_mapper`'s heuristic.
+    forced_mapper: Option<CartridgeMapper>,
 }
 
 impl Bus {
@@ -120,8 +189,9 @@ impl Bus {
         scc: Arc<Mutex<Scc>>,
         cartridge_rom: Option<Vec<u8>>,
         machine: MachineRoms,
+        forced_mapper: Option<CartridgeMapper>,
     ) -> Self {
-        let cartridge_slot = build_cartridge_slot(cartridge_rom, scc);
+        let cartridge_slot = build_cartridge_slot(cartridge_rom, scc, forced_mapper);
         let slots = match machine {
             // MSX2 slot layout (C-BIOS-style):
             //   Slot 0:    C-BIOS MSX2 Main — 32 KiB BIOS at 0x0000.
@@ -199,6 +269,7 @@ impl Bus {
             rtc: Rtc::new(),
             psg,
             psg_reg_select: 0,
+            forced_mapper,
         }
     }
 
@@ -207,7 +278,7 @@ impl Bus {
     /// in main.rs. The slot register is reset to 0 here so the BIOS init
     /// path starts mapping the BIOS at page 0, same as cold boot.
     pub fn swap_cartridge(&mut self, rom: Option<Vec<u8>>, scc: Arc<Mutex<Scc>>) {
-        let cartridge_slot = build_cartridge_slot(rom, scc);
+        let cartridge_slot = build_cartridge_slot(rom, scc, self.forced_mapper);
         self.slots.set_slot(1, cartridge_slot);
         self.slots.slot_register = 0;
         self.ppi.release_all();

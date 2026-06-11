@@ -46,6 +46,10 @@ pub enum Slot {
     KonamiMegaRomSccCartridge(KonamiMegaRomSccCartridge),
     /// Konami "basic" mega-ROM, no SCC (Penguin Adventure, Knightmare, Goonies).
     KonamiMegaRomCartridge(KonamiMegaRomCartridge),
+    /// ASCII 8 KiB mega-ROM (Ys, Aleste, most Falcom/Compile titles).
+    Ascii8Cartridge(Ascii8Cartridge),
+    /// ASCII 16 KiB mega-ROM (Hydlide, many ASCII/HAL/Sony titles).
+    Ascii16Cartridge(Ascii16Cartridge),
 }
 
 impl Memory for Slot {
@@ -58,6 +62,8 @@ impl Memory for Slot {
             Slot::Subslotted(s) => s.read8(addr),
             Slot::KonamiMegaRomSccCartridge(c) => c.read8(addr),
             Slot::KonamiMegaRomCartridge(c) => c.read8(addr),
+            Slot::Ascii8Cartridge(c) => c.read8(addr),
+            Slot::Ascii16Cartridge(c) => c.read8(addr),
         }
     }
 
@@ -70,6 +76,8 @@ impl Memory for Slot {
             Slot::Subslotted(s) => s.write8(addr, value),
             Slot::KonamiMegaRomSccCartridge(c) => c.write8(addr, value),
             Slot::KonamiMegaRomCartridge(c) => c.write8(addr, value),
+            Slot::Ascii8Cartridge(c) => c.write8(addr, value),
+            Slot::Ascii16Cartridge(c) => c.write8(addr, value),
         }
     }
 }
@@ -293,6 +301,13 @@ impl Memory for Slots {
 
     fn write8(&mut self, addr: u16, value: u8) {
         let idx = self.selected_index(addr);
+        // MSX_LOG=slot: trace writes into the cartridge socket's ROM
+        // window — on mega-ROMs these are exactly the bank-switch writes,
+        // which reveals a dump's real mapper protocol when the detection
+        // heuristic comes up short (indirect switchers like Aleste).
+        if idx == 1 && (0x4000..=0xBFFF).contains(&addr) {
+            crate::mlog!(SLOT, "cart wr {:04X} = {:02X}", addr, value);
+        }
         self.slots[idx].write8(addr, value);
     }
 }
@@ -482,7 +497,158 @@ impl Memory for KonamiMegaRomCartridge {
     }
 }
 
+/// ASCII 8 KiB mega-ROM mapper. Four 8 KiB regions at 0x4000-0xBFFF, all
+/// switchable; the bank-select registers live in 2 KiB windows packed into
+/// 0x6000-0x7FFF (fMSX MapROM, MAP_ASCII8: region = `(addr & 0x1800) >> 11`):
+///
+/// | Region        | Switch window  |
+/// |---------------|----------------|
+/// | 0x4000-0x5FFF | 0x6000-0x67FF  |
+/// | 0x6000-0x7FFF | 0x6800-0x6FFF  |
+/// | 0x8000-0x9FFF | 0x7000-0x77FF  |
+/// | 0xA000-0xBFFF | 0x7800-0x7FFF  |
+///
+/// All bank registers reset to 0, so the cartridge boots showing the first
+/// 8 KiB (with the "AB" header) in every region. Games: most Falcom/Compile
+/// /T&E mega-ROMs (Ys, Dragon Slayer, Aleste, ...). The SRAM variant
+/// (Xanadu et al.) is not modelled yet — bank values are masked to ROM size.
+pub struct Ascii8Cartridge {
+    rom: Box<[u8]>,
+    /// Bank per 8 KiB region of the full address space (only 2..=5 used).
+    selected_pages: [u8; 8],
+    /// Region maps the cartridge's SRAM instead of a ROM bank. Selected by
+    /// writing a bank value with the bit just above the ROM's bank count
+    /// set — fMSX MapROM: `if (V & (ROMMask+1))` (Hydlide 3, Xanadu).
+    sram_mapped: [bool; 8],
+    /// 8 KiB battery-backed SRAM, shared by all regions that map it.
+    /// In-memory only for now — survives a session, not an exit.
+    sram: Box<[u8; KONAMI_PAGE_SIZE]>,
+    /// Power-of-two mask over the ROM's 8 KiB bank count.
+    bank_mask: u8,
+}
+
+impl Ascii8Cartridge {
+    pub fn new(rom: Box<[u8]>) -> Self {
+        let banks = (rom.len() / KONAMI_PAGE_SIZE).max(1);
+        let bank_mask = (banks.next_power_of_two() - 1).min(0xFF) as u8;
+        Self {
+            rom,
+            selected_pages: [0; 8],
+            sram_mapped: [false; 8],
+            sram: Box::new([0; KONAMI_PAGE_SIZE]),
+            bank_mask,
+        }
+    }
+}
+
+impl Memory for Ascii8Cartridge {
+    fn read8(&self, addr: u16) -> u8 {
+        let region = (addr >> 13) as usize;
+        if self.sram_mapped[region] {
+            return self.sram[addr as usize & 0x1FFF];
+        }
+        let bank = self.selected_pages[region] as usize;
+        let offset = bank * KONAMI_PAGE_SIZE + (addr as usize & 0x1FFF);
+        self.rom.get(offset).copied().unwrap_or(0xFF)
+    }
+
+    fn write8(&mut self, addr: u16, value: u8) {
+        if (0x6000..=0x7FFF).contains(&addr) {
+            // Window index 0..3 → address-space regions 2..5. The select
+            // windows always win over an SRAM mapping at 0x6000-0x7FFF —
+            // that's why carts put their SRAM window at 0x8000-0xBFFF.
+            let window = ((addr & 0x1800) >> 11) as usize;
+            let sram_bit = self.bank_mask as u16 + 1;
+            self.sram_mapped[window + 2] = (value as u16 & sram_bit) != 0;
+            self.selected_pages[window + 2] = value & self.bank_mask;
+            return;
+        }
+        // Data writes land in SRAM when the target region maps it.
+        if (0x4000..=0xBFFF).contains(&addr) {
+            let region = (addr >> 13) as usize;
+            if self.sram_mapped[region] {
+                self.sram[addr as usize & 0x1FFF] = value;
+            }
+        }
+    }
+}
+
+/// ASCII 16 KiB mega-ROM mapper. Two 16 KiB regions:
+///
+/// | Region        | Switch window  |
+/// |---------------|----------------|
+/// | 0x4000-0x7FFF | 0x6000-0x67FF  |
+/// | 0x8000-0xBFFF | 0x7000-0x77FF  |
+///
+/// Both bank registers reset to 0. Games: Hydlide, R-Type's relatives,
+/// many ASCII/HAL/Sony mega-ROMs. (Androgynus writes its bank to 0x77FF —
+/// inside the canonical window, so it works; the 2 KiB SRAM variant of
+/// Hydlide 2 is not modelled yet.)
+pub struct Ascii16Cartridge {
+    rom: Box<[u8]>,
+    /// Bank per 16 KiB region: [0x4000-0x7FFF, 0x8000-0xBFFF].
+    selected_pages: [u8; 2],
+    /// Region maps the cartridge's SRAM — same select rule as ASCII8
+    /// (bank value with the over-ROM bit set; Hydlide 2's 2 KiB SRAM).
+    sram_mapped: [bool; 2],
+    /// 2 KiB battery-backed SRAM, mirrored across the 16 KiB region.
+    /// In-memory only for now.
+    sram: Box<[u8; 0x800]>,
+    /// Power-of-two mask over the ROM's 16 KiB bank count.
+    bank_mask: u8,
+}
+
+const ASCII16_PAGE_SIZE: usize = 0x4000;
+
+impl Ascii16Cartridge {
+    pub fn new(rom: Box<[u8]>) -> Self {
+        let banks = (rom.len() / ASCII16_PAGE_SIZE).max(1);
+        let bank_mask = (banks.next_power_of_two() - 1).min(0xFF) as u8;
+        Self {
+            rom,
+            selected_pages: [0; 2],
+            sram_mapped: [false; 2],
+            sram: Box::new([0; 0x800]),
+            bank_mask,
+        }
+    }
+}
+
+impl Memory for Ascii16Cartridge {
+    fn read8(&self, addr: u16) -> u8 {
+        if !(0x4000..=0xBFFF).contains(&addr) {
+            return 0xFF;
+        }
+        let region = ((addr - 0x4000) >> 14) as usize;
+        if self.sram_mapped[region] {
+            return self.sram[addr as usize & 0x7FF];
+        }
+        let bank = self.selected_pages[region] as usize;
+        let offset = bank * ASCII16_PAGE_SIZE + (addr as usize & 0x3FFF);
+        self.rom.get(offset).copied().unwrap_or(0xFF)
+    }
+
+    fn write8(&mut self, addr: u16, value: u8) {
+        match addr {
+            0x6000..=0x67FF | 0x7000..=0x77FF => {
+                let region = ((addr >> 12) & 1) as usize;
+                let sram_bit = self.bank_mask as u16 + 1;
+                self.sram_mapped[region] = (value as u16 & sram_bit) != 0;
+                self.selected_pages[region] = value & self.bank_mask;
+            }
+            0x4000..=0xBFFF => {
+                let region = ((addr - 0x4000) >> 14) as usize;
+                if self.sram_mapped[region] {
+                    self.sram[addr as usize & 0x7FF] = value;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Cartridge mapper type, returned by [`detect_mapper`].
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum CartridgeMapper {
     /// Plain ROM (≤ 32 KiB), mapped linearly at 0x4000.
     Plain,
@@ -490,38 +656,232 @@ pub enum CartridgeMapper {
     KonamiBasic,
     /// Konami SCC mega-ROM — bank-switch on writes to 0x5000/0x7000/0x9000/0xB000.
     KonamiSCC,
+    /// ASCII 8 KiB mapper — bank-switch windows packed into 0x6000-0x7FFF.
+    Ascii8,
+    /// ASCII 16 KiB mapper — bank-switch at 0x6000-0x67FF / 0x7000-0x77FF.
+    Ascii16,
+}
+
+impl CartridgeMapper {
+    /// Accepted names for the `--mapper` / `?mapper=` override, paired with
+    /// the mapper they select. One row per mapper — extend this table when
+    /// a new mapper lands and the CLI/web override picks it up for free.
+    /// First name per mapper is the canonical one shown in error messages.
+    pub const NAMES: &'static [(&'static str, CartridgeMapper)] = &[
+        ("plain", CartridgeMapper::Plain),
+        ("konami", CartridgeMapper::KonamiBasic),
+        ("konami-scc", CartridgeMapper::KonamiSCC),
+        ("scc", CartridgeMapper::KonamiSCC),
+        ("ascii8", CartridgeMapper::Ascii8),
+        ("ascii16", CartridgeMapper::Ascii16),
+    ];
+
+    /// Parse a user-supplied mapper name (case-insensitive). `None` for
+    /// unknown names — the caller decides whether to warn or fall back to
+    /// auto-detection.
+    pub fn parse(name: &str) -> Option<Self> {
+        let name = name.to_ascii_lowercase();
+        Self::NAMES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, m)| *m)
+    }
+
+    /// The valid override names, for help/error text.
+    pub fn name_list() -> String {
+        Self::NAMES
+            .iter()
+            .map(|(n, _)| *n)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 /// Pick a mapper for the given ROM. Plain ROMs are detected by size; for
 /// larger ROMs we scan the code for `LD (nn), A` instructions targeting
-/// the bank-select address of either layout and pick the dominant one.
+/// each mapper family's bank-select addresses and pick the dominant one.
 ///
-/// This is the same heuristic openMSX uses, in spirit — accurate enough for
-/// the vast majority of Konami cartridges. ROMs that need a different mapper
-/// entirely (ASCII8, ASCII16, R-Type, etc.) won't be detected; we'd need to
-/// add explicit detection or a manual override for those.
+/// Ported from fMSX's GuessROM (MSX.c). The subtlety is the OVERLAPPING
+/// addresses: 0x6000 is a select address for Konami-basic, ASCII8 *and*
+/// ASCII16, and 0x7000 for Konami-SCC, ASCII8 and ASCII16 — each hit
+/// counts for every family it could belong to, and the per-family totals
+/// decide. The starting biases mirror fMSX: Konami-basic is the fallback
+/// (+1) and ASCII16 is preferred over ASCII8 (-1 on ASCII8), because an
+/// ASCII16 ROM's 0x6000/0x7000 writes also count for ASCII8 — only real
+/// 0x6800/0x7800 hits should swing it to ASCII8.
 pub fn detect_mapper(rom: &[u8]) -> CartridgeMapper {
     if rom.len() <= 32 * 1024 {
         return CartridgeMapper::Plain;
     }
 
-    let mut scc_hits = 0u32;
-    let mut basic_hits = 0u32;
+    // Counts start at fMSX's biases, kept as i32 so ASCII8 can sit at -1
+    // relative to ASCII16 (fMSX inits all to 1, bumps its generic default,
+    // and decrements ASCII8).
+    let mut kon: i32 = 1; // KonamiBasic — also the tie fallback
+    let mut scc: i32 = 0;
+    let mut a8: i32 = -1;
+    let mut a16: i32 = 0;
     for window in rom.windows(3) {
-        // 0x32 = LD (nn), A — the most common bank-switch instruction.
-        if window[0] == 0x32 {
-            let addr = u16::from_le_bytes([window[1], window[2]]);
-            match addr {
-                0x5000 | 0x7000 | 0x9000 | 0xB000 => scc_hits += 1,
-                0x6000 | 0x8000 | 0xA000 => basic_hits += 1,
-                _ => {}
+        // 0x32 = LD (nn), A — the canonical bank-switch instruction.
+        if window[0] != 0x32 {
+            continue;
+        }
+        match u16::from_le_bytes([window[1], window[2]]) {
+            0x5000 | 0x9000 | 0xB000 => scc += 1,
+            0x4000 | 0x8000 | 0xA000 => kon += 1,
+            0x6800 | 0x7800 => a8 += 1,
+            0x6000 => {
+                kon += 1;
+                a8 += 1;
+                a16 += 1;
             }
+            0x7000 => {
+                scc += 1;
+                a8 += 1;
+                a16 += 1;
+            }
+            0x77FF => a16 += 1,
+            _ => {}
         }
     }
 
-    if scc_hits > basic_hits {
-        CartridgeMapper::KonamiSCC
-    } else {
-        CartridgeMapper::KonamiBasic
+    // Highest count wins; ties resolve in declaration order (Konami-basic
+    // first, matching fMSX's index order with GEN8≈KonamiBasic in front).
+    let candidates = [
+        (kon, CartridgeMapper::KonamiBasic),
+        (scc, CartridgeMapper::KonamiSCC),
+        (a8, CartridgeMapper::Ascii8),
+        (a16, CartridgeMapper::Ascii16),
+    ];
+    let mut best = candidates[0];
+    for c in &candidates[1..] {
+        if c.0 > best.0 {
+            best = *c;
+        }
+    }
+    best.1
+}
+
+// --- Tests ------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Synthetic 64 KiB ROM whose 8 KiB banks are filled with their own
+    /// bank index, so a read instantly reveals which bank is mapped.
+    fn numbered_rom(bank_size: usize, banks: usize) -> Box<[u8]> {
+        let mut rom = vec![0u8; bank_size * banks];
+        for (i, chunk) in rom.chunks_mut(bank_size).enumerate() {
+            chunk.fill(i as u8);
+        }
+        rom.into_boxed_slice()
+    }
+
+    #[test]
+    fn ascii8_switches_all_four_regions() {
+        let mut c = Ascii8Cartridge::new(numbered_rom(0x2000, 8));
+        // Reset state: every region shows bank 0.
+        assert_eq!(c.read8(0x4000), 0);
+        assert_eq!(c.read8(0xA000), 0);
+        // Window per region: 6000→4000, 6800→6000, 7000→8000, 7800→A000.
+        c.write8(0x6000, 4);
+        c.write8(0x6800, 5);
+        c.write8(0x7000, 6);
+        c.write8(0x7800, 7);
+        assert_eq!(c.read8(0x4000), 4);
+        assert_eq!(c.read8(0x6000), 5);
+        assert_eq!(c.read8(0x8000), 6);
+        assert_eq!(c.read8(0xBFFF), 7);
+        // A bank value with the over-ROM bit set maps the SRAM instead
+        // (fMSX `V & (ROMMask+1)`). Writes land in SRAM and read back;
+        // deselecting brings the ROM bank back with SRAM contents intact.
+        c.write8(0x7000, 8); // region 0x8000-0x9FFF → SRAM
+        c.write8(0x8000, 0xAB);
+        assert_eq!(c.read8(0x8000), 0xAB);
+        c.write8(0x7000, 6); // back to ROM bank 6
+        assert_eq!(c.read8(0x8000), 6);
+        c.write8(0x7000, 8);
+        assert_eq!(c.read8(0x8000), 0xAB);
+    }
+
+    #[test]
+    fn ascii16_sram_select_and_mirror() {
+        let mut c = Ascii16Cartridge::new(numbered_rom(0x4000, 8));
+        // Over-ROM bit (8 banks → bit 8) maps the 2 KiB SRAM, mirrored
+        // across the 16 KiB region (Hydlide 2 style).
+        c.write8(0x7000, 8);
+        c.write8(0x8000, 0x5A);
+        assert_eq!(c.read8(0x8000), 0x5A);
+        assert_eq!(c.read8(0x8800), 0x5A); // 2 KiB mirror
+        c.write8(0x7000, 2);
+        assert_eq!(c.read8(0x8000), 2);
+    }
+
+    #[test]
+    fn ascii16_switches_both_regions() {
+        let mut c = Ascii16Cartridge::new(numbered_rom(0x4000, 8));
+        assert_eq!(c.read8(0x4000), 0);
+        assert_eq!(c.read8(0x8000), 0);
+        c.write8(0x6000, 3);
+        c.write8(0x7000, 5);
+        assert_eq!(c.read8(0x4000), 3);
+        assert_eq!(c.read8(0x7FFF), 3);
+        assert_eq!(c.read8(0x8000), 5);
+        assert_eq!(c.read8(0xBFFF), 5);
+        // Androgynus-style: select register at the window's last byte.
+        c.write8(0x77FF, 1);
+        assert_eq!(c.read8(0x8000), 1);
+        // Writes outside the select windows do NOT switch banks.
+        c.write8(0x6800, 7);
+        assert_eq!(c.read8(0x4000), 3);
+    }
+
+    /// Build a >32 KiB ROM stuffed with `LD (addr),A` instructions for the
+    /// given switch addresses — the detector counts exactly these.
+    fn rom_with_writes(addrs: &[u16]) -> Vec<u8> {
+        let mut rom = vec![0u8; 64 * 1024];
+        let mut pos = 0usize;
+        for addr in addrs.iter().cycle().take(64) {
+            rom[pos] = 0x32;
+            rom[pos + 1] = (*addr & 0xFF) as u8;
+            rom[pos + 2] = (*addr >> 8) as u8;
+            pos += 4; // gap so windows don't overlap mid-instruction
+        }
+        rom
+    }
+
+    #[test]
+    fn detect_konami_scc_rom() {
+        let rom = rom_with_writes(&[0x5000, 0x7000, 0x9000, 0xB000]);
+        assert_eq!(detect_mapper(&rom), CartridgeMapper::KonamiSCC);
+    }
+
+    #[test]
+    fn detect_konami_basic_rom() {
+        let rom = rom_with_writes(&[0x6000, 0x8000, 0xA000]);
+        assert_eq!(detect_mapper(&rom), CartridgeMapper::KonamiBasic);
+    }
+
+    #[test]
+    fn detect_ascii8_rom() {
+        // ASCII8 games hit all four packed windows; the 6800/7800 writes
+        // are what distinguishes them from ASCII16.
+        let rom = rom_with_writes(&[0x6000, 0x6800, 0x7000, 0x7800]);
+        assert_eq!(detect_mapper(&rom), CartridgeMapper::Ascii8);
+    }
+
+    #[test]
+    fn detect_ascii16_rom() {
+        // Only 6000/7000 traffic: counts for ASCII8 and ASCII16 alike, but
+        // ASCII16's starting bias wins — mirroring fMSX's preference.
+        let rom = rom_with_writes(&[0x6000, 0x7000]);
+        assert_eq!(detect_mapper(&rom), CartridgeMapper::Ascii16);
+    }
+
+    #[test]
+    fn detect_small_rom_as_plain() {
+        let rom = vec![0u8; 16 * 1024];
+        assert_eq!(detect_mapper(&rom), CartridgeMapper::Plain);
     }
 }
