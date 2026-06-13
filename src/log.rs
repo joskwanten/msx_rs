@@ -55,6 +55,7 @@ pub mod cat {
     pub const SLOT:       u32 = 1 << 6;
     pub const BUS:        u32 = 1 << 7;
     pub const FM:         u32 = 1 << 8;
+    pub const GLITCH:     u32 = 1 << 9;
     pub const ALL:        u32 = u32::MAX;
 }
 
@@ -97,6 +98,7 @@ pub fn parse_mask(s: &str) -> u32 {
             "slot"       => cat::SLOT,
             "bus"        => cat::BUS,
             "fm"         => cat::FM,
+            "glitch"     => cat::GLITCH,
             "all"        => cat::ALL,
             other => {
                 warn_unknown(other);

@@ -562,7 +562,7 @@ impl State {
         // texture (which we keep equal to the surface format for colour-space
         // consistency).
         let vdp = Vdp::new(&device, surface_format);
-        let post = Post::new(&device, surface_format);
+        let post = Post::new(&device, &queue, surface_format);
         let shader_mode = initial_shader_mode();
         #[cfg(target_arch = "wasm32")]
         web_sys::console::log_1(
@@ -695,15 +695,27 @@ impl State {
         while self.clock.0.0 < frame_tstates {
             let current_line = self.clock.0.0 / SCANLINE_TSTATES;
 
-            // Walk last_line up to current_line (capped at the last
-            // visible line), snapshotting and firing line interrupts at
-            // each boundary we cross. The `while` covers the case where
-            // a single long instruction crosses a scanline boundary —
-            // we still process the snapshot/IRQ for the new line.
-            let target = current_line.min(VISIBLE_LINES as i32 - 1);
+            // Walk last_line up to current_line, snapshotting (visible
+            // lines only) and firing line interrupts at each boundary we
+            // cross. The `while` covers the case where a single long
+            // instruction crosses a scanline boundary — we still process
+            // the snapshot/IRQ for the new line.
+            //
+            // The line-COINCIDENCE check runs over ALL frame lines,
+            // including border/vblank — fMSX evaluates
+            // `((ScanLine + VScroll) & 0xFF) - R19 == 2` on every one of
+            // the 262 (NTSC) / 313 (PAL) lines, and split-screen games
+            // park their next coincidence in the border on purpose (the
+            // handler re-arms there, invisibly). Checking only the
+            // visible 212 made Quarth's handler chain skip a beat during
+            // heavy frames and double-fire on a visible line — a one-
+            // frame wrong-band flash.
+            let target = current_line;
             while last_line < target {
                 last_line += 1;
-                self.bus.vdp.snapshot_scanline(last_line as usize);
+                if (last_line as u32) < VISIBLE_LINES {
+                    self.bus.vdp.snapshot_scanline(last_line as usize);
+                }
                 // Per fMSX (MSX.c line-coincidence): FH (S1 bit 0) is set on
                 // EVERY coincidence — only the IRQ is gated on IE1. Games
                 // without IE1 poll S1 for the match (Space Manbow does this

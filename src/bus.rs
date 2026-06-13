@@ -241,10 +241,15 @@ impl Bus {
                 let bios = RomSlot::new(Box::from(CBIOS_MAIN), 0x0000);
                 let basic = RomSlot::new(Box::from(CBIOS_BASIC), 0x4000);
                 let sub_rom = RomSlot::new(Box::from(CBIOS_SUB), 0x0000);
+                // 3-2: C-BIOS MSX-MUSIC — same embedded ROM the NMS-8245
+                // machine uses in slot 2. Games find the APRLOPLL id and
+                // enable FM on this machine too (the YM2413 lives on I/O
+                // ports 0x7C/0x7D regardless of machine).
+                let music = RomSlot::new(CBIOS_MUSIC.to_vec().into_boxed_slice(), 0x4000);
                 let slot3 = SubslottedSlot::new([
                     Slot::Empty,                           // 3-0
                     Slot::Rom(sub_rom),                    // 3-1 ← C-BIOS Sub-ROM
-                    Slot::Empty,                           // 3-2
+                    Slot::Rom(music),                      // 3-2 ← C-BIOS MSX-MUSIC
                     Slot::MappedRam(MappedRamSlot::new()), // 3-3 ← RAM mapper
                 ]);
                 Slots::new([

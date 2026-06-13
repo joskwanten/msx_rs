@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 bytemuck = { version = "1.25.0", features = ["derive"] }
+# Decodes the embedded hq4x weight LUT (256×256 RGBA PNG) once at startup.
+# Pure-Rust inflate (miniz_oxide) — builds for wasm32 too.
+png = { version = "0.17", default-features = false }
 psg = "1.0"
 wgpu = "29.0.3"
 winit = "0.30"

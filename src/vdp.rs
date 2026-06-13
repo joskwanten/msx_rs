@@ -19,6 +19,10 @@ pub const VRAM_SIZE: usize = 128 * 1024;
 /// Z80 T-states per scanline (3.58 MHz / 15.7 kHz; fMSX HPERIOD/6 = 228).
 /// Must match the frame loop's scanline constant in main.rs.
 const SCANLINE_TSTATES: i32 = 228;
+/// `beam_line` value meaning "vertical blanking" — no visible line under
+/// the beam.
+const BEAM_VBLANK: u16 = 0xFFFF;
+
 /// T-state within the scanline where horizontal blanking begins. The
 /// display portion is HREFRESH_256/6 ≈ 170 T-states (fMSX MSX.h); the
 /// remaining ~58 are HBlank, during which S2's HR bit reads 1.
@@ -182,6 +186,19 @@ pub struct Vdp {
     /// `read_status` — Space Manbow busy-waits on HR for its in-game
     /// split-screen timing instead of using the line interrupt.
     scanline_phase: i32,
+
+    /// Visible scanline the beam is on (set by `snapshot_scanline`), or
+    /// [`BEAM_VBLANK`] during vertical blanking. Diagnostic only: the
+    /// `MSX_LOG=glitch` channel uses it to flag commands issued while the
+    /// beam is mid-frame — the race our single-VRAM-snapshot renderer
+    /// can't display correctly (suspected Quarth glitch).
+    beam_line: u16,
+    /// Frame counter for the glitch log (≈ seconds × 60/50). Wraps, fine.
+    frame_no: u32,
+    /// Line IRQs fired during the current / previous frame — a frame
+    /// where the split misses (count drops) is glitch suspect #2.
+    line_irqs_this_frame: u32,
+    line_irqs_prev_frame: u32,
 
     /// Set when a line interrupt has fired and the CPU hasn't yet
     /// acknowledged by reading status register S1. Combined with R0[4]
@@ -412,6 +429,10 @@ impl Vdp {
             cpu_xfer: CpuXfer::None,
             cmd_busy: 0,
             scanline_phase: 0,
+            beam_line: BEAM_VBLANK,
+            frame_no: 0,
+            line_irqs_this_frame: 0,
+            line_irqs_prev_frame: 0,
             cpu_xfer_x: 0,
             cpu_xfer_y: 0,
             vram_buf,
@@ -510,6 +531,7 @@ impl Vdp {
         // than (or alongside) the IRQ. Cleared at the top of the next
         // frame's visible scan-out by `clear_vblank_flag`.
         self.status[2] |= 0x40;
+        self.beam_line = BEAM_VBLANK;
     }
 
     /// Clear S2 bit 6 (VR), called at the start of a new frame's visible
@@ -977,6 +999,7 @@ impl Vdp {
     /// where the IRQ fires at the end of a line and the handler sets up
     /// for the next.
     pub fn snapshot_scanline(&mut self, line: usize) {
+        self.beam_line = line as u16;
         if line < self.scanline_snap.len() {
             self.scanline_snap[line] = LineSnapshot {
                 r0: self.regs[0],
@@ -1022,6 +1045,16 @@ impl Vdp {
     /// that drives line IRQs and snapshots.
     pub fn reset_scanline_phase(&mut self) {
         self.scanline_phase = 0;
+        // Glitch diagnostics, frame boundary: a frame whose line-IRQ
+        // count differs from its neighbour usually means a split missed
+        // (or doubled) — one band renders with the wrong page/scroll.
+        self.frame_no = self.frame_no.wrapping_add(1);
+        if self.line_irqs_this_frame != self.line_irqs_prev_frame {
+            mlog!(GLITCH, "frame {}: line-IRQs {} (prev {})",
+                  self.frame_no, self.line_irqs_this_frame, self.line_irqs_prev_frame);
+        }
+        self.line_irqs_prev_frame = self.line_irqs_this_frame;
+        self.line_irqs_this_frame = 0;
     }
 
     /// Fire a V9938 line interrupt: set FH (S1 bit 0) and latch the
@@ -1030,6 +1063,7 @@ impl Vdp {
     pub fn fire_line_irq(&mut self) {
         self.status[1] |= 0x01;
         self.line_irq_pending = true;
+        self.line_irqs_this_frame += 1;
     }
 
     /// Drop FH outside the coincidence line when IE1 is disabled — fMSX
@@ -2330,6 +2364,32 @@ impl Vdp {
     /// Build a `CmdCtx` over `self`'s state and run the command currently
     /// staged in R46. Triggered by `write_register` when R46 is written.
     fn execute_command(&mut self) {
+        // Glitch diagnostics: a VRAM-side command issued while the beam is
+        // inside the visible field races our end-of-frame VRAM snapshot.
+        // The harmless case (Quarth does this every frame) writes rows the
+        // beam hasn't reached yet — real hardware would show the same
+        // post-blit data when the beam arrives. The HAZARD case writes
+        // rows the beam already passed in the page being displayed: real
+        // hardware showed the OLD data there this frame, we render the new
+        // — a one-frame flash of "other" VRAM content.
+        let cmd = self.regs[46] >> 4;
+        if self.beam_line != BEAM_VBLANK && matches!(cmd, 0x7..=0x9 | 0xC..=0xE) {
+            let dy = (u16::from_le_bytes([self.regs[38], self.regs[39]]) & 0x3FF) as u32;
+            let ny = (u16::from_le_bytes([self.regs[42], self.regs[43]]) & 0x3FF) as u32;
+            let diy_up = self.regs[45] & 0x08 != 0;
+            // Topmost row the command writes (approximate, G4 geometry).
+            let top = if diy_up { dy.saturating_sub(ny.max(1) - 1) } else { dy };
+            let dest_page = top >> 8;
+            let displayed_page = ((self.regs[2] >> 5) & 3) as u32;
+            if dest_page == displayed_page && (top & 0xFF) < self.beam_line as u32 {
+                mlog!(GLITCH,
+                      "frame {}: HAZARD cmd 0x{:X} writes row {} above beam @ line {} (page {})",
+                      self.frame_no, cmd, top & 0xFF, self.beam_line, displayed_page);
+            } else {
+                mlog!(GLITCH, "frame {}: cmd 0x{:X} mid-frame @ line {} (below beam/off-page)",
+                      self.frame_no, cmd, self.beam_line);
+            }
+        }
         let mut ctx = CmdCtx {
             regs: &mut self.regs,
             vram: &mut self.vram[..],

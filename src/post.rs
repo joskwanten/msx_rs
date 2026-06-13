@@ -22,6 +22,10 @@ pub enum ShaderMode {
     /// EPX / Scale2x edge-aware upscale — diagonals get anti-aliased per the
     /// 5-tap palette-equality rule, everything else stays as crisp as Sharp.
     Pixely,
+    /// hq4x — Maxim Stepin's LUT-based 4× upscale. Smoother than Pixely: a
+    /// YUV-threshold edge test over the full 3×3 neighbourhood drives a baked
+    /// 256-pattern lookup table (`hq4x_lut.png`) of blend weights.
+    Hq4x,
 }
 
 impl ShaderMode {
@@ -30,16 +34,18 @@ impl ShaderMode {
             "sharp" => Some(ShaderMode::Sharp),
             "crt" => Some(ShaderMode::Crt),
             "pixely" | "scale2x" | "epx" => Some(ShaderMode::Pixely),
+            "hq4x" | "hqx" => Some(ShaderMode::Hq4x),
             _ => None,
         }
     }
 
     pub fn toggle(self) -> Self {
-        // Cycle: Sharp → Crt → Pixely → Sharp. Alt+S walks through them.
+        // Cycle: Sharp → Crt → Pixely → Hq4x → Sharp. Alt+S walks through them.
         match self {
             ShaderMode::Sharp => ShaderMode::Crt,
             ShaderMode::Crt => ShaderMode::Pixely,
-            ShaderMode::Pixely => ShaderMode::Sharp,
+            ShaderMode::Pixely => ShaderMode::Hq4x,
+            ShaderMode::Hq4x => ShaderMode::Sharp,
         }
     }
 
@@ -48,6 +54,7 @@ impl ShaderMode {
             ShaderMode::Sharp => "sharp",
             ShaderMode::Crt => "crt",
             ShaderMode::Pixely => "pixely",
+            ShaderMode::Hq4x => "hq4x",
         }
     }
 }
@@ -88,6 +95,7 @@ pub struct Post {
     pipeline_sharp: wgpu::RenderPipeline,
     pipeline_crt: wgpu::RenderPipeline,
     pipeline_pixely: wgpu::RenderPipeline,
+    pipeline_hq4x: wgpu::RenderPipeline,
 }
 
 impl Post {
@@ -95,7 +103,11 @@ impl Post {
     /// pipelines. `target_format` is the surface format — used for both the
     /// intermediate (so the colour-space behaviour matches end-to-end) and
     /// the final pipeline's colour target.
-    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target_format: wgpu::TextureFormat,
+    ) -> Self {
         // Intermediate render target. Same format as the surface so colour
         // space stays consistent across both passes (linear on native sRGB
         // surfaces, raw sRGB-encoded on web's Bgra8Unorm).
@@ -137,6 +149,12 @@ impl Post {
             ..Default::default()
         });
 
+        // hq4x weight lookup table: a 256×256 RGBA8 image baked from Stepin's
+        // 256-pattern ruleset. Embedded in the binary and decoded once here.
+        // Stored as non-sRGB Rgba8Unorm so the sampler returns the raw 0..1
+        // blend weights (not gamma-decoded colours), and read with NEAREST.
+        let lut_view = load_hq4x_lut(device, queue);
+
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("post uniforms"),
             size: std::mem::size_of::<PostUniforms>() as u64,
@@ -173,6 +191,19 @@ impl Post {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // hq4x weight LUT. Only the hq4x shader reads this; the other
+                // three declare no @binding(3) and ignore it. Present in the
+                // shared layout so all four pipelines keep one bind group.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -193,6 +224,10 @@ impl Post {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&sampler_nearest),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&lut_view),
+                },
             ],
         });
         let bind_group_linear = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -210,6 +245,10 @@ impl Post {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&sampler_linear),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&lut_view),
                 },
             ],
         });
@@ -241,6 +280,13 @@ impl Post {
             "post pixely",
             include_str!("post_pixely.wgsl"),
         );
+        let pipeline_hq4x = build_pipeline(
+            device,
+            &pipeline_layout,
+            target_format,
+            "post hq4x",
+            include_str!("post_hq4x.wgsl"),
+        );
 
         Self {
             intermediate_view,
@@ -250,6 +296,7 @@ impl Post {
             pipeline_sharp,
             pipeline_crt,
             pipeline_pixely,
+            pipeline_hq4x,
         }
     }
 
@@ -286,9 +333,67 @@ impl Post {
                 render_pass.set_pipeline(&self.pipeline_pixely);
                 render_pass.set_bind_group(0, &self.bind_group_nearest, &[]);
             }
+            ShaderMode::Hq4x => {
+                // Like Pixely, hq4x classifies edges on exact palette colours,
+                // so the source must be sampled *nearest*. The LUT (bound in
+                // the same group) is read nearest too.
+                render_pass.set_pipeline(&self.pipeline_hq4x);
+                render_pass.set_bind_group(0, &self.bind_group_nearest, &[]);
+            }
         }
         render_pass.draw(0..3, 0..1);
     }
+}
+
+/// Decode the embedded hq4x weight LUT and upload it as a 256×256 Rgba8Unorm
+/// texture. The PNG is verified non-interlaced RGBA8 at build time, so any
+/// decode failure here is a corrupted binary, not a runtime input — hence the
+/// `expect`s rather than a fallible return.
+fn load_hq4x_lut(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::TextureView {
+    const LUT_PNG: &[u8] = include_bytes!("hq4x_lut.png");
+
+    let mut reader = png::Decoder::new(LUT_PNG)
+        .read_info()
+        .expect("hq4x LUT: PNG header");
+    let mut rgba = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut rgba).expect("hq4x LUT: PNG decode");
+    assert!(
+        info.color_type == png::ColorType::Rgba && info.bit_depth == png::BitDepth::Eight,
+        "hq4x LUT must be 8-bit RGBA",
+    );
+
+    let size = wgpu::Extent3d {
+        width: info.width,
+        height: info.height,
+        depth_or_array_layers: 1,
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("hq4x LUT"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &rgba[..(info.width * info.height * 4) as usize],
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(info.width * 4),
+            rows_per_image: Some(info.height),
+        },
+        size,
+    );
+
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
 fn build_pipeline(

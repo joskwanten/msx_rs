@@ -31,6 +31,12 @@
          (see [tools] there). That version auto-preserves reference-types
          and bulk-memory, so `-Oz` is safe again. -->
     <link data-trunk rel="rust" data-bin="msx_rs" data-wasm-opt="z" />
+    <!-- Ship the system ROMs (NMS8245 set for ?bios=, optional fmpac.rom)
+         and the game library so ?rom= / ?bios= / ?disk= URLs resolve.
+         C-BIOS and the MSX-MUSIC fallback are compiled into the wasm and
+         don't need these; only the real-machine extras live here. -->
+    <link data-trunk rel="copy-dir" href="assets" />
+    <link data-trunk rel="copy-dir" href="games" />
 </head>
 <body>
 </body>
