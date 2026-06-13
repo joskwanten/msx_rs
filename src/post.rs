@@ -80,10 +80,13 @@ struct PostUniforms {
 /// happens in linear space, which physically bleeds bright colours more than
 /// the gamma-incorrect sRGB blur on web; tighter tap brings the perceived
 /// softness back in line with the web look.
+///
+/// This is just the *default* now — the Video menu's CRT-blur slider can
+/// override it at runtime via [`Post::set_crt_blur`].
 #[cfg(target_arch = "wasm32")]
-const CRT_BLUR: f32 = 0.60;
+pub const CRT_BLUR: f32 = 0.60;
 #[cfg(not(target_arch = "wasm32"))]
-const CRT_BLUR: f32 = 0.36;
+pub const CRT_BLUR: f32 = 0.36;
 
 pub struct Post {
     /// 320×240 texture the VDP renders into. `intermediate_view()` exposes
@@ -96,6 +99,9 @@ pub struct Post {
     pipeline_crt: wgpu::RenderPipeline,
     pipeline_pixely: wgpu::RenderPipeline,
     pipeline_hq4x: wgpu::RenderPipeline,
+    /// Current CRT blur tap distance, uploaded to the shader each frame.
+    /// Starts at the per-platform [`CRT_BLUR`] default; the UI can change it.
+    crt_blur: f32,
 }
 
 impl Post {
@@ -297,7 +303,18 @@ impl Post {
             pipeline_crt,
             pipeline_pixely,
             pipeline_hq4x,
+            crt_blur: CRT_BLUR,
         }
+    }
+
+    /// Current CRT blur tap distance (for the Video menu slider).
+    pub fn crt_blur(&self) -> f32 {
+        self.crt_blur
+    }
+
+    /// Override the CRT blur tap distance. Takes effect on the next `upload`.
+    pub fn set_crt_blur(&mut self, blur: f32) {
+        self.crt_blur = blur;
     }
 
     /// View handle for the intermediate texture — what the VDP renders into.
@@ -308,7 +325,7 @@ impl Post {
     pub fn upload(&self, queue: &wgpu::Queue, output_size: (u32, u32), backdrop: [f32; 4]) {
         let u = PostUniforms {
             output_size: [output_size.0 as f32, output_size.1 as f32],
-            crt_blur: CRT_BLUR,
+            crt_blur: self.crt_blur,
             _pad: 0.0,
             backdrop,
         };

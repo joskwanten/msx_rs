@@ -1398,6 +1398,16 @@ impl Vdp {
         self.regs[9] & 0x02 != 0
     }
 
+    /// Read-only view of the S0–S9 status registers (for the debug UI).
+    pub fn status(&self) -> &[u8; 10] {
+        &self.status
+    }
+
+    /// Read-only view of the 16-entry palette in shader RGBA (`f32`) form.
+    pub fn palette(&self) -> &[[f32; 4]; 16] {
+        &self.palette
+    }
+
     fn write_control(&mut self, value: u8) {
         if !self.has_latched_data {
             self.latched_data = value;

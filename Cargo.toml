@@ -5,10 +5,20 @@ edition = "2024"
 
 [dependencies]
 bytemuck = { version = "1.25.0", features = ["derive"] }
+# Overlay UI. The 0.34 line pins wgpu ^29 / winit ^0.30 — exactly our stack.
+# egui-winit has no default features enabled (we don't need its system
+# clipboard / link-opener / wayland / x11 extras, and dropping them trims the
+# wasm build).
+egui = "0.34"
+egui-winit = { version = "0.34", default-features = false }
+egui-wgpu = "0.34"
 # Decodes the embedded hq4x weight LUT (256×256 RGBA PNG) once at startup.
 # Pure-Rust inflate (miniz_oxide) — builds for wasm32 too.
 png = { version = "0.17", default-features = false }
 psg = "1.0"
+# Native file dialogs + a wasm `AsyncFileDialog` (over an <input type=file>),
+# for the "Open ROM/Disk…" menu items.
+rfd = "0.15"
 wgpu = "29.0.3"
 winit = "0.30"
 z80emu = "0.11"

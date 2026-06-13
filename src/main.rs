@@ -1,6 +1,7 @@
 mod audio;
 mod bus;
 mod fdc;
+mod gui;
 mod log;
 mod post;
 mod ppi;
@@ -12,6 +13,7 @@ mod ym2413;
 
 use audio::Audio;
 use bus::Bus;
+use gui::{CpuRegs, DebugView, Gui, UiAction, UiSnapshot};
 use post::{Post, ShaderMode};
 use std::num::Wrapping;
 use std::sync::Arc;
@@ -31,7 +33,7 @@ use winit::{
 use std::time::{Duration, Instant};
 #[cfg(target_arch = "wasm32")]
 use web_time::{Duration, Instant};
-use z80emu::{host::TsCounter, Cpu, Z80NMOS};
+use z80emu::{host::TsCounter, Cpu, Prefix, Reg8, Z80NMOS};
 
 /// T-states per emulated frame at NTSC (3.579545 MHz / 60 Hz). One call to
 /// `execute_with_limit` consumes this many cycles before we raise the next
@@ -469,6 +471,29 @@ struct State {
     post: Post,
     /// Currently active post-process shader. Toggled at runtime via Alt+S.
     shader_mode: ShaderMode,
+    /// egui overlay (menu bar + its wgpu renderer). Toggle with F9.
+    gui: Gui,
+    /// When true, `step_to_realtime` is skipped — the machine is frozen but the
+    /// UI stays live. Set from the Machine ▸ Pause checkbox.
+    paused: bool,
+    /// The currently inserted cartridge bytes, kept so Machine ▸ Reset can
+    /// re-plug the same ROM (a clean reboot, mapper banks and all). `None` when
+    /// running diskless BASIC.
+    cartridge_rom: Option<Vec<u8>>,
+    /// Set by the File ▸ Quit menu item; honoured in `about_to_wait`, which has
+    /// the `ActiveEventLoop` needed to exit. Native only (web has no "quit").
+    #[cfg(not(target_arch = "wasm32"))]
+    quit_requested: bool,
+    /// Inbox for a ROM picked via File ▸ Open ROM… on the web. The async file
+    /// dialog future writes here; `about_to_wait` drains it (same pattern as
+    /// the drag-and-drop `pending_rom` slot on `App`).
+    #[cfg(target_arch = "wasm32")]
+    file_inbox_rom: std::rc::Rc<std::cell::RefCell<Option<Vec<u8>>>>,
+    /// Rendered-frames-per-second, shown in the debug menu bar. Updated over a
+    /// short sampling window in `render`.
+    fps: f32,
+    fps_frames: u32,
+    fps_window_start: Instant,
     /// Crash-hunting aid (MSX_PCTRACE=2): ring buffer of the most recent
     /// instruction PCs. Dumped when the PC falls back to the reset vector
     /// region (< 0x10) from running code — i.e. an unexpected reboot — so
@@ -563,6 +588,7 @@ impl State {
         // consistency).
         let vdp = Vdp::new(&device, surface_format);
         let post = Post::new(&device, &queue, surface_format);
+        let gui = Gui::new(&device, surface_format, &window);
         let shader_mode = initial_shader_mode();
         #[cfg(target_arch = "wasm32")]
         web_sys::console::log_1(
@@ -579,6 +605,8 @@ impl State {
         #[cfg(target_arch = "wasm32")]
         let machine = load_machine_roms().await;
 
+        // Keep a copy of the boot ROM so Machine ▸ Reset can re-plug it.
+        let cartridge_rom_stored = cartridge_rom.clone();
         let bus = Bus::new(
             vdp,
             Arc::clone(&audio.psg),
@@ -613,6 +641,16 @@ impl State {
             audio,
             post,
             shader_mode,
+            gui,
+            paused: false,
+            cartridge_rom: cartridge_rom_stored,
+            #[cfg(not(target_arch = "wasm32"))]
+            quit_requested: false,
+            #[cfg(target_arch = "wasm32")]
+            file_inbox_rom: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            fps: 0.0,
+            fps_frames: 0,
+            fps_window_start: Instant::now(),
             pc_ring: vec![0u16; 64],
             pc_ring_idx: 0,
             pc_prev: 0,
@@ -636,6 +674,8 @@ impl State {
             scc.reset();
         }
         self.bus.vdp.reset();
+        // Remember the inserted ROM so Machine ▸ Reset can re-plug it.
+        self.cartridge_rom = rom.clone();
         self.bus
             .swap_cartridge(rom, std::sync::Arc::clone(&self.audio.scc));
         // Z80NMOS::default() leaves SP = 0 which makes the BIOS spin in RST
@@ -644,6 +684,120 @@ impl State {
         self.cpu.reset();
         self.clock = TsCounter::<i32>::default();
         self.msx_frame_accumulator = 0.0;
+    }
+
+    /// Read the Z80 register file for the CPU debug panel.
+    fn cpu_regs(&self) -> CpuRegs {
+        let c = &self.cpu;
+        let reg16 = |hi: Reg8, lo: Reg8| {
+            ((c.get_reg(hi, None) as u16) << 8) | c.get_reg(lo, None) as u16
+        };
+        let (ixh, ixl) = c.get_index2(Prefix::Xdd);
+        let (iyh, iyl) = c.get_index2(Prefix::Yfd);
+        let (iff1, iff2) = c.get_iffs();
+        CpuRegs {
+            pc: c.get_pc(),
+            sp: c.get_sp(),
+            af: ((c.get_acc() as u16) << 8) | c.get_flags().bits() as u16,
+            bc: reg16(Reg8::B, Reg8::C),
+            de: reg16(Reg8::D, Reg8::E),
+            hl: reg16(Reg8::H, Reg8::L),
+            ix: ((ixh as u16) << 8) | ixl as u16,
+            iy: ((iyh as u16) << 8) | iyl as u16,
+            i: c.get_i(),
+            r: c.get_r(),
+            im: match c.get_im() {
+                z80emu::InterruptMode::Mode0 => 0,
+                z80emu::InterruptMode::Mode1 => 1,
+                z80emu::InterruptMode::Mode2 => 2,
+            },
+            iff1,
+            iff2,
+            halt: c.is_halt(),
+        }
+    }
+
+    /// Snapshot of the bits the menu reflects (current shader, pause, etc.).
+    fn ui_snapshot(&self) -> UiSnapshot {
+        UiSnapshot {
+            shader: self.shader_mode,
+            paused: self.paused,
+            crt_blur: self.post.crt_blur(),
+            mapper: self.bus.forced_mapper,
+            fullscreen: self.window.fullscreen().is_some(),
+        }
+    }
+
+    /// Show/hide the menu bar. On every transition we release all MSX keys —
+    /// otherwise a key whose key-up got eaten by egui (or that was held when
+    /// the menu opened) would stick down in the matrix.
+    fn set_ui_visible(&mut self, visible: bool) {
+        if self.gui.visible != visible {
+            self.gui.visible = visible;
+            self.bus.ppi.release_all();
+            self.window.request_redraw();
+        }
+    }
+
+    fn toggle_ui(&mut self) {
+        self.set_ui_visible(!self.gui.visible);
+    }
+
+    /// Carry out a command emitted by the menu. Called after the frame is drawn,
+    /// so it can take `&mut self` freely.
+    fn apply_ui_action(&mut self, action: UiAction) {
+        match action {
+            UiAction::SetShader(mode) => self.shader_mode = mode,
+            UiAction::SetCrtBlur(blur) => self.post.set_crt_blur(blur),
+            UiAction::SetPaused(paused) => self.paused = paused,
+            UiAction::SetForcedMapper(mapper) => self.bus.forced_mapper = mapper,
+            UiAction::Reset => self.load_cartridge(self.cartridge_rom.clone()),
+            UiAction::ToggleFullscreen => {
+                let target = if self.window.fullscreen().is_some() {
+                    None
+                } else {
+                    Some(Fullscreen::Borderless(None))
+                };
+                self.window.set_fullscreen(target);
+            }
+            UiAction::OpenRom => self.open_rom_dialog(),
+            #[cfg(not(target_arch = "wasm32"))]
+            UiAction::Quit => self.quit_requested = true,
+        }
+    }
+
+    /// File ▸ Open ROM…. Native uses a blocking system dialog (correct on the
+    /// main thread); web spawns the async dialog and routes the bytes through
+    /// `file_inbox_rom`, drained in `about_to_wait`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_rom_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("MSX ROM", &["rom", "mx1", "mx2", "ROM", "zip"])
+            .pick_file()
+        {
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    eprintln!("opened cartridge: {} ({} bytes)", path.display(), bytes.len());
+                    self.load_cartridge(Some(bytes));
+                }
+                Err(e) => eprintln!("failed to read {}: {}", path.display(), e),
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn open_rom_dialog(&mut self) {
+        let inbox = std::rc::Rc::clone(&self.file_inbox_rom);
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(handle) = rfd::AsyncFileDialog::new()
+                .add_filter("MSX ROM", &["rom", "mx1", "mx2", "zip"])
+                .pick_file()
+                .await
+            {
+                let bytes = handle.read().await;
+                *inbox.borrow_mut() = Some(bytes);
+            }
+        });
     }
 
     /// Run the CPU for one MSX frame, stepping per scanline so V9938
@@ -961,9 +1115,63 @@ impl State {
             self.post.draw(&mut render_pass, self.shader_mode);
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        // Pass 3 (only when the menu is up): egui overlay, layered over the
+        // post output on the same surface view (LoadOp::Load). The UI emits a
+        // list of actions we apply *after* present, so the closure doesn't
+        // borrow emulator state while it runs.
+        let mut ui_actions: Vec<UiAction> = Vec::new();
+        let mut egui_cmds: Vec<wgpu::CommandBuffer> = Vec::new();
+        if self.gui.visible {
+            // Refresh the FPS estimate over a short sampling window.
+            self.fps_frames += 1;
+            let elapsed = self.fps_window_start.elapsed().as_secs_f32();
+            if elapsed >= 0.5 {
+                self.fps = self.fps_frames as f32 / elapsed;
+                self.fps_frames = 0;
+                self.fps_window_start = Instant::now();
+            }
+
+            let screen = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [self.config.width, self.config.height],
+                pixels_per_point: egui_winit::pixels_per_point(
+                    self.gui.egui_ctx(),
+                    &self.window,
+                ),
+            };
+            let snapshot = self.ui_snapshot();
+            let dbg = DebugView {
+                cpu: self.cpu_regs(),
+                pc_ring: &self.pc_ring,
+                pc_ring_idx: self.pc_ring_idx,
+                vdp_regs: &self.bus.vdp.regs,
+                vdp_status: self.bus.vdp.status(),
+                palette: self.bus.vdp.palette(),
+                vram: &self.bus.vdp.vram[..],
+                is_pal: self.bus.vdp.is_pal(),
+                fps: self.fps,
+            };
+            let (actions, full_output) = self.gui.run(&self.window, &snapshot, &dbg);
+            egui_cmds = self.gui.paint(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &view,
+                &screen,
+                full_output,
+            );
+            ui_actions = actions;
+        }
+
+        // egui's user-callback command buffers (if any) must run before the
+        // main encoder; chain them into the single submit.
+        self.queue
+            .submit(egui_cmds.into_iter().chain(std::iter::once(encoder.finish())));
         self.window.pre_present_notify();
         surface_texture.present();
+
+        for action in ui_actions {
+            self.apply_ui_action(action);
+        }
 
         Ok(())
     }
@@ -1076,6 +1284,20 @@ impl ApplicationHandler for App {
             return;
         };
 
+        // Let egui see the event first (it needs pointer/scroll/text input for
+        // the menus). `consumed` tells us egui wants exclusive use of it — in
+        // that case we keep it away from the MSX keyboard and the emulator
+        // shortcuts. RedrawRequested is the one event egui doesn't care about.
+        let egui_consumed = if matches!(event, WindowEvent::RedrawRequested) {
+            false
+        } else {
+            let resp = state.gui.on_window_event(&state.window, &event);
+            if resp.repaint {
+                state.window.request_redraw();
+            }
+            resp.consumed
+        };
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(physical_size) => state.resize(physical_size),
@@ -1090,25 +1312,31 @@ impl ApplicationHandler for App {
                     state.audio.resume();
                 }
                 if let PhysicalKey::Code(code) = event.physical_key {
+                    let pressed = event.state == ElementState::Pressed;
                     // Fullscreen toggle: Alt+Enter (Windows/Linux) or
-                    // Cmd+Enter (Mac). Both nicely outside the MSX matrix
-                    // and not eaten by the browser or macOS media keys.
+                    // Cmd+Enter (Mac). Both nicely outside the MSX matrix and
+                    // not eaten by the browser or macOS media keys.
                     let fullscreen_modifier =
                         self.modifiers.alt_key() || self.modifiers.super_key();
-                    if fullscreen_modifier
-                        && code == KeyCode::Enter
-                        && event.state == ElementState::Pressed
-                    {
+                    // Menu toggle. F9 isn't on the MSX matrix (F1–F5 are), so
+                    // it's a safe host-only hotkey; Esc closes the menu when
+                    // it's open (and otherwise still reaches the MSX). These
+                    // win regardless of what egui thinks.
+                    if code == KeyCode::F9 && pressed {
+                        state.toggle_ui();
+                    } else if code == KeyCode::Escape && pressed && state.gui.visible {
+                        state.set_ui_visible(false);
+                    } else if egui_consumed {
+                        // egui is using this key (e.g. typing in a field) —
+                        // don't forward it to the MSX or fire shortcuts.
+                    } else if fullscreen_modifier && code == KeyCode::Enter && pressed {
                         let target = if state.window.fullscreen().is_some() {
                             None
                         } else {
                             Some(Fullscreen::Borderless(None))
                         };
                         state.window.set_fullscreen(target);
-                    } else if self.modifiers.alt_key()
-                        && code == KeyCode::KeyS
-                        && event.state == ElementState::Pressed
-                    {
+                    } else if self.modifiers.alt_key() && code == KeyCode::KeyS && pressed {
                         // Shader toggle. Only the Alt modifier — not super —
                         // because Cmd+S is "save" in every browser and would
                         // pop the download dialog on the web build.
@@ -1120,7 +1348,6 @@ impl ApplicationHandler for App {
                         #[cfg(not(target_arch = "wasm32"))]
                         eprintln!("shader: {}", state.shader_mode.label());
                     } else if let Some((row, col)) = map_key(code) {
-                        let pressed = event.state == ElementState::Pressed;
                         state.bus.ppi.set_key(row, col, pressed);
                     }
                 }
@@ -1161,12 +1388,30 @@ impl ApplicationHandler for App {
 
         let Some(state) = self.state.as_mut() else { return };
 
+        // File ▸ Quit (native): the menu set a flag because applying actions in
+        // `render` has no `ActiveEventLoop`; honour it here.
+        #[cfg(not(target_arch = "wasm32"))]
+        if state.quit_requested {
+            event_loop.exit();
+            return;
+        }
+
         // Drain any cartridge ROM dropped or picked through the browser DOM
         // before we step the next frame — the swap resets the CPU and clock,
         // so doing it mid-frame would leave half-executed state behind.
         #[cfg(target_arch = "wasm32")]
         if let Some(rom) = self.pending_rom.borrow_mut().take() {
             state.load_cartridge(Some(rom));
+        }
+        // Same, for a ROM chosen via File ▸ Open ROM… on the web (the async
+        // file dialog writes into this inbox). Take into a local first so the
+        // RefCell borrow is released before `load_cartridge` touches `state`.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let picked = state.file_inbox_rom.borrow_mut().take();
+            if let Some(rom) = picked {
+                state.load_cartridge(Some(rom));
+            }
         }
 
         // Drive emulation here rather than from `render()` so the audio thread
@@ -1182,8 +1427,11 @@ impl ApplicationHandler for App {
         // irregular phase and made per-frame sprite flicker strobe. With this
         // gate each emulated frame is shown exactly once; vsync simply holds
         // the last frame when the host refresh outruns 60 Hz.
-        let frames_stepped = state.step_to_realtime();
-        if frames_stepped > 0 {
+        //
+        // While paused we don't step, but the menu still needs to animate and
+        // respond, so request a redraw whenever it's visible.
+        let frames_stepped = if state.paused { 0 } else { state.step_to_realtime() };
+        if frames_stepped > 0 || state.gui.visible {
             state.window.request_redraw();
         }
 

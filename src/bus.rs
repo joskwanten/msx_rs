@@ -202,8 +202,9 @@ pub struct Bus {
     psg_reg_select: u8,
     /// `--mapper` / `?mapper=` override, applied to the boot cartridge and
     /// every drag-and-drop swap for the rest of the session. `None` = use
-    /// `detect_mapper`'s heuristic.
-    forced_mapper: Option<CartridgeMapper>,
+    /// `detect_mapper`'s heuristic. Pub so the Video/Machine menu can change
+    /// it at runtime (takes effect on the next cartridge load).
+    pub forced_mapper: Option<CartridgeMapper>,
 }
 
 impl Bus {

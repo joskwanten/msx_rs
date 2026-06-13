@@ -72,18 +72,42 @@ and the BASIC cartridge into slot 2. Slot 1 is the user cartridge socket
 — a game ROM goes there at runtime via drag-and-drop. With slot 1 empty
 the BIOS scan reaches slot 2 and boots BASIC.
 
+### Optional: real NMS-8245 BIOS
+
+The default is C-BIOS. To boot the real Philips **NMS-8245** ROMs instead
+(needed for disk software and a few games that probe the original BIOS),
+place the dump in `assets/NMS8245/`:
+
+```
+assets/NMS8245/MSX2.ROM       (32 KiB — main BIOS)
+assets/NMS8245/MSX2EXT.ROM    (16 KiB — sub-ROM)
+assets/NMS8245/DISK.ROM       (16 KiB — optional WD2793 disk BIOS)
+```
+
+Then select it at startup:
+
+- **Native:** `MSX_BIOS=nms8245 cargo run --release -- game.rom`
+  (or `MSX_BIOS=/path/to/dir` to point at a ROM set elsewhere)
+- **Web:** add `?bios=nms8245` to the URL.
+
+Anything else (or a missing/wrong-sized ROM) falls back to C-BIOS. Without
+`DISK.ROM` the machine boots diskless. An optional `assets/fmpac.rom` dump
+replaces the embedded MSX-MUSIC ROM in slot 2.
+
 ### Native
 
 ```sh
-cargo run --release [-- [--shader MODE] [path/to/cartridge.rom]]
+cargo run --release [-- [--shader MODE] [--mapper NAME] [--disk game.dsk] [path/to/cartridge.rom]]
 ```
 
 Examples:
 
 ```sh
-cargo run --release                                        # boots into BASIC
-cargo run --release -- my-game.rom                         # loads a cartridge
-cargo run --release -- --shader crt SALAMAND.ROM           # with CRT shader
+cargo run --release                                          # boots into BASIC
+cargo run --release -- my-game.rom                           # loads a cartridge
+cargo run --release -- --shader crt SALAMAND.ROM             # with CRT shader
+cargo run --release -- --shader hq4x USAS.ROM                # hq4x upscale
+MSX_BIOS=nms8245 cargo run --release -- --disk game.dsk      # real BIOS + disk
 ```
 
 ### Web
@@ -100,16 +124,24 @@ URL parameters:
 
 - `?rom=path/to/file.rom` — fetches a cartridge at start. Subject to CORS,
   so usually only same-origin files work.
-- `?shader=sharp|crt|pixely` — initial shader mode.
+- `?shader=sharp|crt|pixely|hq4x` — initial shader mode.
+- `?bios=nms8245` — boot the real NMS-8245 ROMs (see above) instead of C-BIOS.
+- `?disk=path/to/file.dsk` — mount a disk image in drive A (needs `?bios=nms8245`).
+- `?mapper=NAME` — force a cartridge mapper (`konami`, `konami-scc`, `ascii8`, …).
 
 ## Controls
 
 | Input | Action |
 |---|---|
 | MSX keyboard keys | Mapped 1:1 from the host keyboard where layouts overlap. |
+| **F9** | Toggle the menu bar (File / Machine / Video / Debug). **Esc** closes it. |
 | **Alt/Cmd + Enter** | Toggle fullscreen. |
-| **Alt + S** | Cycle shader: sharp → crt → pixely → sharp. |
+| **Alt + S** | Cycle shader: sharp → crt → pixely → hq4x → sharp. |
 | Drag-and-drop a `.rom` | Hot-swap the cartridge. Resets the CPU, VDP, and audio. |
+
+The menu bar (F9) exposes the same options as a UI: open ROM, reset, pause,
+mapper override, shader/CRT-blur/fullscreen, and **Debug** windows (CPU, VDP,
+palette, sprites, VRAM).
 
 ## Logging
 
